@@ -14,6 +14,16 @@ import org.apache.iceberg.DeleteFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.puffin.Blob;
+import org.apache.iceberg.puffin.Puffin;
+import org.apache.iceberg.puffin.PuffinWriter;
+import org.apache.iceberg.puffin.PuffinReader;
+import org.apache.iceberg.puffin.StandardBlobTypes;
+import org.apache.iceberg.GenericStatisticsFile;
+import org.apache.iceberg.GenericBlobMetadata;
+import org.apache.iceberg.StatisticsFile;
+import org.apache.iceberg.Transaction;
+import org.apache.iceberg.util.Pair;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -172,6 +182,7 @@ public class IcebergService {
     /**
      * Sync a specific shard to Iceberg catalog.
      * Called by TransportShardSyncIcebergAction for each shard.
+     * Syncs Parquet files as data files and archives other files in Puffin format.
      */
     public Map<String, Object> syncShard(ShardId shardId) throws IOException {
         String indexName = shardId.getIndexName();
@@ -186,9 +197,23 @@ public class IcebergService {
             throw new IllegalArgumentException("Index not found: " + indexName);
         }
         
-        // Read active files for THIS shard only
-        Map<String, UploadedSegmentMetadata> activeFiles = readShardFiles(indexName, indexUUID, shardNum, indexMetadata);
-        logger.info("[Iceberg Shard Sync] Shard {}: found {} files", shardId, activeFiles.size());
+        // Read Parquet files from metadata
+        Map<String, UploadedSegmentMetadata> parquetFiles = readShardFiles(indexName, indexUUID, shardNum, indexMetadata);
+        logger.info("[Iceberg Shard Sync] Shard {}: found {} Parquet files", shardId, parquetFiles.size());
+        
+        // List ALL files from S3 directly (for archiving)
+        Map<String, Long> allS3Files = listAllFilesFromS3(indexName, indexUUID, shardNum, indexMetadata);
+        logger.info("[Iceberg Shard Sync] Shard {}: found {} total files in S3", shardId, allS3Files.size());
+        
+        // Separate non-Parquet files for Puffin archiving
+        Map<String, Long> nonParquetFiles = new HashMap<>();
+        for (Map.Entry<String, Long> entry : allS3Files.entrySet()) {
+            if (!entry.getKey().contains("/parquet/")) {
+                nonParquetFiles.put(entry.getKey(), entry.getValue());
+            }
+        }
+        logger.info("[Iceberg Shard Sync] Shard {}: found {} non-Parquet files for Puffin archiving", 
+                   shardId, nonParquetFiles.size());
         
         // Infer schema from index mappings (only once, cached in table)
         org.apache.iceberg.Schema icebergSchema = null;
@@ -215,23 +240,23 @@ public class IcebergService {
             }
         }
         
-        // Compute diff for this shard
+        // Compute diff for Parquet files
         Map<String, UploadedSegmentMetadata> filesToAdd = new HashMap<>();
-        for (Map.Entry<String, UploadedSegmentMetadata> entry : activeFiles.entrySet()) {
+        for (Map.Entry<String, UploadedSegmentMetadata> entry : parquetFiles.entrySet()) {
             if (!catalogFiles.contains(entry.getKey())) {
                 filesToAdd.put(entry.getKey(), entry.getValue());
             }
         }
         
         Set<String> filesToRemove = new HashSet<>(catalogFiles);
-        filesToRemove.removeAll(activeFiles.keySet());
+        filesToRemove.removeAll(parquetFiles.keySet());
         
-        int filesKept = activeFiles.size() - filesToAdd.size();
+        int filesKept = parquetFiles.size() - filesToAdd.size();
         
-        logger.info("[Iceberg Shard Sync] Shard {}: add={}, remove={}, keep={}", 
+        logger.info("[Iceberg Shard Sync] Shard {}: Parquet add={}, remove={}, keep={}", 
                    shardId, filesToAdd.size(), filesToRemove.size(), filesKept);
         
-        // Apply changes
+        // Apply Parquet file changes
         if (!filesToAdd.isEmpty()) {
             addFilesToCatalog(table, filesToAdd);
         }
@@ -240,11 +265,18 @@ public class IcebergService {
             removeFilesFromCatalog(table, filesToRemove);
         }
         
+        // Archive non-Parquet files in Puffin format (incremental)
+        int archivedFiles = 0;
+        if (!nonParquetFiles.isEmpty()) {
+            archivedFiles = archiveFilesAsPuffin(table, nonParquetFiles, shardId);
+        }
+        
         // Return results
         Map<String, Object> result = new HashMap<>();
         result.put("files_added", filesToAdd.size());
         result.put("files_removed", filesToRemove.size());
         result.put("files_kept", filesKept);
+        result.put("files_archived", archivedFiles);
         
         return result;
     }
@@ -668,6 +700,284 @@ public class IcebergService {
             
             delete.commit();
             logger.info("[Iceberg Plugin] Removed {} stale files from catalog", filesToRemove.size());
+        } finally {
+            Thread.currentThread().setContextClassLoader(originalClassLoader);
+        }
+    }
+    
+    /**
+     * List all files for a shard from known subdirectories.
+     * Targets specific paths where OpenSearch stores different file types.
+     */
+    private Map<String, Long> listAllFilesFromS3(
+        String indexName,
+        String indexUUID,
+        int shardNum,
+        IndexMetadata indexMetadata
+    ) throws IOException {
+        Map<String, Long> allFiles = new HashMap<>();
+        
+        try {
+            String remoteStoreRepo = "test-rs-repo";
+            
+            // Get repository
+            org.opensearch.repositories.Repository repository = repositoriesServiceSupplier.get().repository(remoteStoreRepo);
+            org.opensearch.repositories.blobstore.BlobStoreRepository blobRepo = 
+                (org.opensearch.repositories.blobstore.BlobStoreRepository) repository;
+            
+            // Get bucket and base path
+            org.opensearch.cluster.metadata.RepositoryMetadata repoMetadata = blobRepo.getMetadata();
+            Settings repoSettings = repoMetadata.settings();
+            String bucketName = repoSettings.get("bucket");
+            String basePath = repoSettings.get("base_path", "");
+            
+            // Build base shard path
+            org.opensearch.common.blobstore.BlobPath shardPath = org.opensearch.common.blobstore.BlobPath.cleanPath();
+            if (!basePath.isEmpty()) {
+                for (String segment : basePath.split("/")) {
+                    if (!segment.isEmpty()) {
+                        shardPath = shardPath.add(segment);
+                    }
+                }
+            }
+            shardPath = shardPath.add(indexUUID).add(String.valueOf(shardNum));
+            
+            logger.info("[Iceberg Plugin] Base shard path: {}", shardPath.buildAsString());
+            
+            org.opensearch.common.blobstore.BlobStore blobStore = blobRepo.blobStore();
+            
+            // List files from known subdirectories where OpenSearch stores data
+            String[][] knownPaths = {
+                {"translog", "data"},      // Transaction log data files
+                {"translog", "metadata"},  // Transaction log metadata
+                {"segments", "metadata"}   // Segment metadata files
+            };
+            
+            for (String[] pathSegments : knownPaths) {
+                org.opensearch.common.blobstore.BlobPath currentPath = shardPath;
+                for (String segment : pathSegments) {
+                    currentPath = currentPath.add(segment);
+                }
+                
+                logger.info("[Iceberg Plugin] Checking path: {}", currentPath.buildAsString());
+                
+                try {
+                    org.opensearch.common.blobstore.BlobContainer container = blobStore.blobContainer(currentPath);
+                    
+                    // List immediate files
+                    Map<String, org.opensearch.common.blobstore.BlobMetadata> files = container.listBlobs();
+                    logger.info("[Iceberg Plugin] Found {} files in {}", files.size(), currentPath.buildAsString());
+                    
+                    // Check for numbered subdirectories (translog/data/1/, translog/data/2/, etc.)
+                    Map<String, org.opensearch.common.blobstore.BlobContainer> children = container.children();
+                    logger.info("[Iceberg Plugin] Found {} subdirectories in {}", children.size(), currentPath.buildAsString());
+                    
+                    for (Map.Entry<String, org.opensearch.common.blobstore.BlobContainer> childEntry : children.entrySet()) {
+                        String childName = childEntry.getKey();
+                        org.opensearch.common.blobstore.BlobContainer childContainer = childEntry.getValue();
+                        
+                        Map<String, org.opensearch.common.blobstore.BlobMetadata> childFiles = childContainer.listBlobs();
+                        logger.info("[Iceberg Plugin] Found {} files in {}/{}", childFiles.size(), currentPath.buildAsString(), childName);
+                        
+                        // Add child files to results
+                        for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> fileEntry : childFiles.entrySet()) {
+                            String fileName = fileEntry.getKey();
+                            long fileSize = fileEntry.getValue().length();
+                            
+                            String s3Path = String.format("s3://%s/%s%s/%s",
+                                bucketName,
+                                currentPath.buildAsString(),
+                                childName,
+                                fileName);
+                            
+                            allFiles.put(s3Path, fileSize);
+                            logger.debug("[Iceberg Plugin] Found file: {}", s3Path);
+                        }
+                    }
+                    
+                } catch (Exception e) {
+                    logger.warn("[Iceberg Plugin] Could not list path {}: {}", currentPath.buildAsString(), e.getMessage());
+                }
+            }
+            
+            logger.info("[Iceberg Plugin] Listed {} total files from known locations", allFiles.size());
+            
+        } catch (Exception e) {
+            logger.error("[Iceberg Plugin] Failed to list files from S3: {}", e.getMessage(), e);
+            throw new IOException("Failed to list S3 files", e);
+        }
+        
+        return allFiles;
+    }
+    
+    /**
+     * Archive non-Parquet files in Puffin format (append-only, no incremental).
+     * Creates a new Puffin file for this sync. Old Puffins cleaned up by snapshot lifecycle.
+     */
+    private int archiveFilesAsPuffin(Table table, Map<String, Long> filesToArchive, ShardId shardId) {
+        if (filesToArchive.isEmpty()) {
+            return 0;
+        }
+        
+        ClassLoader originalClassLoader = Thread.currentThread().getContextClassLoader();
+        Thread.currentThread().setContextClassLoader(S3TablesIcebergManager.class.getClassLoader());
+        
+        try {
+            String warehouseLocation = table.location();
+            org.apache.iceberg.aws.s3.S3FileIO s3FileIO = S3TablesIcebergManager.getInstance().getFileIO();
+            
+            // Create unique Puffin file with timestamp (append-only approach)
+            long timestamp = System.currentTimeMillis();
+            String puffinFileName = String.format("opensearch-archive-shard-%d-%d.puffin", shardId.id(), timestamp);
+            String puffinPath = warehouseLocation + "/data/archive/" + puffinFileName;
+            
+            logger.info("[Puffin Archive] Creating archive in /data/archive/: {}", puffinFileName);
+            logger.info("[Puffin Archive] Full path: {}", puffinPath);
+            
+            // Write to local temp file first, then upload to S3
+            // This bypasses S3OutputStream complexity and ensures complete file
+            java.io.File tempFile = new java.io.File(System.getProperty("java.io.tmpdir"), 
+                "puffin-shard-" + shardId.id() + "-" + timestamp + ".tmp");
+            
+            // Delete if exists from previous run
+            if (tempFile.exists()) {
+                tempFile.delete();
+            }
+            
+            org.apache.iceberg.io.OutputFile tempOutputFile = org.apache.iceberg.Files.localOutput(tempFile);
+            PuffinWriter writer = null;
+            
+            try {
+                writer = Puffin.write(tempOutputFile)
+                    .createdBy("opensearch-iceberg-plugin")
+                    .build();
+                
+                // Archive all files as blobs
+                int archived = 0;
+                long snapshotId = table.currentSnapshot() != null ? table.currentSnapshot().snapshotId() : 0L;
+                long sequenceNumber = table.currentSnapshot() != null ? table.currentSnapshot().sequenceNumber() : 0L;
+                
+                for (Map.Entry<String, Long> entry : filesToArchive.entrySet()) {
+                    String sourcePath = entry.getKey();
+                    
+                    try {
+                        // Read file from source
+                        org.apache.iceberg.io.InputFile sourceFile = s3FileIO.newInputFile(sourcePath);
+                        byte[] content;
+                        try (java.io.InputStream in = sourceFile.newStream()) {
+                            content = in.readAllBytes();
+                        }
+                        
+                        // Create blob (type, fields, snapshotId, sequenceNumber, data)
+                        List<Integer> inputFields = new ArrayList<>();
+                        inputFields.add(1);
+                        
+                        Blob blob = new Blob(
+                            "opensearch-segment-file",
+                            inputFields,
+                            snapshotId,
+                            sequenceNumber,
+                            java.nio.ByteBuffer.wrap(content)
+                        );
+                        
+                        writer.add(blob);
+                        archived++;
+                        logger.info("[Puffin Archive] Archived: {} ({} bytes)", sourcePath, content.length);
+                        
+                    } catch (Exception e) {
+                        logger.error("[Puffin Archive] Failed to archive {}: {}", sourcePath, e.getMessage());
+                    }
+                }
+                
+                // Debug: Check blob metadata before finish
+                logger.info("[Puffin Archive] Blob metadata count before finish: {}", writer.writtenBlobsMetadata().size());
+                
+                writer.finish();
+                
+                // Debug: Verify footer was written
+                long fileSize = writer.fileSize();
+                long footerSize = writer.footerSize();
+                logger.info("[Puffin Archive] After finish() - file size: {}, footer size: {}", fileSize, footerSize);
+                logger.info("[Puffin Archive] Blob metadata count after finish: {}", writer.writtenBlobsMetadata().size());
+                
+                // Close writer - writes complete Puffin to local temp file
+                writer.close();
+                logger.info("[Puffin Archive] Puffin written to local temp file: {} bytes", tempFile.length());
+                
+                // Now upload complete file to S3
+                logger.info("[Puffin Archive] Uploading complete Puffin to S3: {}", puffinPath);
+                try (java.io.InputStream fileIn = new java.io.FileInputStream(tempFile);
+                     java.io.OutputStream s3Out = s3FileIO.newOutputFile(puffinPath).create()) {
+                    byte[] buffer = new byte[8192];
+                    int bytesRead;
+                    while ((bytesRead = fileIn.read(buffer)) != -1) {
+                        s3Out.write(buffer, 0, bytesRead);
+                    }
+                }
+                logger.info("[Puffin Archive] Puffin uploaded to S3 successfully");
+                
+                // Clean up temp file
+                tempFile.delete();
+                
+                // Register Puffin with table snapshot
+                if (table.currentSnapshot() != null && archived > 0) {
+                    long currentSnapshotId = table.currentSnapshot().snapshotId();
+                    
+                    // Re-read to get metadata
+                    PuffinReader reader = Puffin.read(s3FileIO.newInputFile(puffinPath)).build();
+                    List<org.apache.iceberg.puffin.BlobMetadata> puffinBlobMetadata = reader.fileMetadata().blobs();
+                    
+                    // Convert to Iceberg BlobMetadata
+                    List<org.apache.iceberg.BlobMetadata> blobMetadataList = new ArrayList<>();
+                    for (org.apache.iceberg.puffin.BlobMetadata puffinBlob : puffinBlobMetadata) {
+                        blobMetadataList.add(new GenericBlobMetadata(
+                            puffinBlob.type(),
+                            puffinBlob.snapshotId(),
+                            puffinBlob.sequenceNumber(),
+                            puffinBlob.inputFields(),
+                            java.util.Map.of()
+                        ));
+                    }
+                    reader.close();
+                    
+                    StatisticsFile statisticsFile = new GenericStatisticsFile(
+                        currentSnapshotId,
+                        puffinPath,
+                        fileSize,
+                        footerSize,
+                        blobMetadataList
+                    );
+                    
+                    // Register via Transaction
+                    Transaction transaction = table.newTransaction();
+                    transaction.updateStatistics()
+                        .setStatistics(currentSnapshotId, statisticsFile)
+                        .commit();
+                    transaction.commitTransaction();
+                    
+                    logger.info("[Puffin Archive] Registered Puffin with snapshot {} ({} blobs)", 
+                               currentSnapshotId, archived);
+                }
+                
+                return archived;
+                
+            } catch (Exception writerException) {
+                logger.error("[Puffin Archive] Writer operation failed", writerException);
+                return 0;
+            } finally {
+                // Ensure writer is closed even if exception occurs
+                if (writer != null) {
+                    try {
+                        writer.close();
+                    } catch (Exception closeException) {
+                        logger.warn("[Puffin Archive] Failed to close writer", closeException);
+                    }
+                }
+            }
+            
+        } catch (Exception e) {
+            logger.error("[Puffin Archive] Failed: {}", e.getMessage(), e);
+            return 0;
         } finally {
             Thread.currentThread().setContextClassLoader(originalClassLoader);
         }

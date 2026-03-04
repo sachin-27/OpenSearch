@@ -25,12 +25,14 @@ public class SyncIcebergResponse extends BroadcastResponse {
     private int filesAdded;
     private int filesRemoved;
     private int filesKept;
+    private int filesArchived;
     
     public SyncIcebergResponse(StreamInput in) throws IOException {
         super(in);
         filesAdded = in.readVInt();
         filesRemoved = in.readVInt();
         filesKept = in.readVInt();
+        filesArchived = in.readVInt();
     }
     
     public SyncIcebergResponse(
@@ -42,10 +44,24 @@ public class SyncIcebergResponse extends BroadcastResponse {
         int filesRemoved,
         int filesKept
     ) {
+        this(totalShards, successfulShards, failedShards, shardFailures, filesAdded, filesRemoved, filesKept, 0);
+    }
+    
+    public SyncIcebergResponse(
+        int totalShards,
+        int successfulShards,
+        int failedShards,
+        List<DefaultShardOperationFailedException> shardFailures,
+        int filesAdded,
+        int filesRemoved,
+        int filesKept,
+        int filesArchived
+    ) {
         super(totalShards, successfulShards, failedShards, shardFailures);
         this.filesAdded = filesAdded;
         this.filesRemoved = filesRemoved;
         this.filesKept = filesKept;
+        this.filesArchived = filesArchived;
     }
     
     public int getFilesAdded() {
@@ -60,12 +76,17 @@ public class SyncIcebergResponse extends BroadcastResponse {
         return filesKept;
     }
     
+    public int getFilesArchived() {
+        return filesArchived;
+    }
+    
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
         out.writeVInt(filesAdded);
         out.writeVInt(filesRemoved);
         out.writeVInt(filesKept);
+        out.writeVInt(filesArchived);
     }
     
     @Override
@@ -75,6 +96,7 @@ public class SyncIcebergResponse extends BroadcastResponse {
         builder.field("files_added", filesAdded);
         builder.field("files_removed", filesRemoved);
         builder.field("files_kept", filesKept);
+        builder.field("files_archived", filesArchived);
         builder.endObject();
         return builder;
     }

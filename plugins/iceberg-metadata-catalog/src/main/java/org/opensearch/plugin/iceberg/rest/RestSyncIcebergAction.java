@@ -78,6 +78,7 @@ public class RestSyncIcebergAction extends BaseRestHandler {
                         builder.field("files_added", response.getFilesAdded());
                         builder.field("files_removed", response.getFilesRemoved());
                         builder.field("files_kept", response.getFilesKept());
+                        builder.field("files_archived", response.getFilesArchived());
                         builder.endObject();
                         
                         channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));

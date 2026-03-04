@@ -52,14 +52,14 @@ dependencies {
     // Apache Avro (required by Iceberg DataFiles)
     api 'org.apache.avro:avro:1.11.3'
 
-    // Apache HttpClient 5 for RESTCatalog
-    api('org.apache.httpcomponents.client5:httpclient5:5.2.1') {
+    // Apache HttpClient 5 for RESTCatalog - use versions compatible with OpenSearch
+    api('org.apache.httpcomponents.client5:httpclient5:5.4.4') {
         exclude group: 'org.slf4j'
     }
-    api('org.apache.httpcomponents.core5:httpcore5:5.2') {
+    api('org.apache.httpcomponents.core5:httpcore5:5.3.4') {
         exclude group: 'org.slf4j'
     }
-    api('org.apache.httpcomponents.core5:httpcore5-h2:5.2') {
+    api('org.apache.httpcomponents.core5:httpcore5-h2:5.3.4') {
         exclude group: 'org.slf4j'
     }
     
@@ -117,6 +117,9 @@ dependencies {
     api 'commons-codec:commons-codec:1.18.0'
     api 'org.apache.logging.log4j:log4j-1.2-api:2.21.0'
     api 'commons-logging:commons-logging:1.2'
+    
+    // Compression libraries for Puffin
+    api 'io.airlift:aircompressor:0.27'
     
     // AWS netty HTTP client for ApacheHttpClientConfigurations
     api "software.amazon.awssdk:netty-nio-client:2.32.29"

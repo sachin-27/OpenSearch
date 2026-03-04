@@ -91,7 +91,7 @@ testClusters {
     setting 'cluster.remote_store.index.path.type', 'fixed'
     setting 'node.attr.remote_store.repository.test-rs-repo.type', 's3'
     setting 'node.attr.remote_store.repository.test-rs-repo.settings.bucket', 'srirasac-iceberg-test'
-    setting 'node.attr.remote_store.repository.test-rs-repo.settings.base_path', 'repository'
+    setting 'node.attr.remote_store.repository.test-rs-repo.settings.base_path', 'srirasac-repository'
     setting 'node.attr.remote_store.repository.test-rs-repo.settings.region', 'us-west-2'
     setting 'node.attr.remote_store.segment.repository', 'test-rs-repo'
     setting 'node.attr.remote_store.translog.repository', 'test-rs-repo'
