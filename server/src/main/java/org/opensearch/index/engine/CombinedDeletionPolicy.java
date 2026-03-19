@@ -62,7 +62,7 @@ import java.util.function.LongSupplier;
 public class CombinedDeletionPolicy extends IndexDeletionPolicy {
     private final Logger logger;
     private final TranslogDeletionPolicy translogDeletionPolicy;
-    private final SoftDeletesPolicy softDeletesPolicy;
+    private volatile SoftDeletesPolicy softDeletesPolicy;
     private final LongSupplier globalCheckpointSupplier;
     private final Map<IndexCommit, Integer> snapshottedCommits; // Number of snapshots held against each commit point.
     private volatile IndexCommit safeCommit; // the most recent safe commit point - its max_seqno at most the persisted global checkpoint.
@@ -81,6 +81,15 @@ public class CombinedDeletionPolicy extends IndexDeletionPolicy {
         this.softDeletesPolicy = softDeletesPolicy;
         this.globalCheckpointSupplier = globalCheckpointSupplier;
         this.snapshottedCommits = new HashMap<>();
+    }
+
+    /**
+     * Sets the soft deletes policy for deferred initialization.
+     * This is needed when the SoftDeletesPolicy cannot be created before the CombinedDeletionPolicy
+     * (e.g., in CompositeEngine where SoftDeletesPolicy depends on commit data from the committer).
+     */
+    public void setSoftDeletesPolicy(SoftDeletesPolicy softDeletesPolicy) {
+        this.softDeletesPolicy = softDeletesPolicy;
     }
 
     @Override
@@ -175,10 +184,15 @@ public class CombinedDeletionPolicy extends IndexDeletionPolicy {
      * Index files of the capturing commit point won't be released until the commit reference is closed.
      *
      * @param acquiringSafeCommit captures the most recent safe commit point if true; otherwise captures the most recent commit point.
+     * @throws EngineNotInitializedException if the deletion policy has not been initialized yet (no commits exist)
      */
     public synchronized IndexCommit acquireIndexCommit(boolean acquiringSafeCommit) {
-        assert safeCommit != null : "Safe commit is not initialized yet";
-        assert lastCommit != null : "Last commit is not initialized yet";
+        if (safeCommit == null) {
+            throw new EngineNotInitializedException("Safe commit is not initialized yet - deletion policy has not processed any commits");
+        }
+        if (lastCommit == null) {
+            throw new EngineNotInitializedException("Last commit is not initialized yet - deletion policy has not processed any commits");
+        }
         final IndexCommit snapshotting = acquiringSafeCommit ? safeCommit : lastCommit;
         snapshottedCommits.merge(snapshotting, 1, Integer::sum); // increase refCount
         return new SnapshotIndexCommit(snapshotting);

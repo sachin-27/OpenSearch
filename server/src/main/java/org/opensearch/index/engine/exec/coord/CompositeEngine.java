@@ -10,11 +10,13 @@ package org.opensearch.index.engine.exec.coord;
 
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
+import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.index.IndexCommit;
 import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.AlreadyClosedException;
 import org.opensearch.common.Nullable;
 import org.opensearch.common.SetOnce;
+import org.opensearch.common.TriConsumer;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.lease.Releasable;
@@ -46,7 +48,9 @@ import org.opensearch.index.engine.SafeCommitInfo;
 import org.opensearch.index.engine.SearchExecEngine;
 import org.opensearch.index.engine.Segment;
 import org.opensearch.index.engine.SegmentsStats;
+import org.opensearch.index.engine.SoftDeletesPolicy;
 import org.opensearch.index.engine.VersionValue;
+import org.opensearch.index.engine.exec.FileMetadata;
 import org.opensearch.index.engine.exec.FileStats;
 import org.opensearch.index.engine.exec.IndexingExecutionEngine;
 import org.opensearch.index.engine.exec.RefreshInput;
@@ -76,12 +80,14 @@ import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.shard.DocsStats;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.index.store.Store;
+import org.opensearch.index.translog.Checkpoint;
 import org.opensearch.index.translog.DefaultTranslogDeletionPolicy;
 import org.opensearch.index.translog.InternalTranslogManager;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.index.translog.TranslogCorruptedException;
 import org.opensearch.index.translog.TranslogDeletionPolicy;
 import org.opensearch.index.translog.TranslogException;
+import org.opensearch.index.translog.TranslogHeader;
 import org.opensearch.index.translog.TranslogManager;
 import org.opensearch.index.translog.TranslogOperationHelper;
 import org.opensearch.index.translog.listener.CompositeTranslogEventListener;
@@ -89,15 +95,15 @@ import org.opensearch.index.translog.listener.TranslogEventListener;
 import org.opensearch.indices.pollingingest.PollingIngestStats;
 import org.opensearch.plugins.PluginsService;
 import org.opensearch.plugins.SearchEnginePlugin;
-import org.opensearch.plugins.spi.vectorized.DataFormat;
 import org.opensearch.search.suggest.completion.CompletionStats;
+import org.opensearch.plugins.spi.vectorized.DataFormat;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -111,7 +117,6 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -120,12 +125,12 @@ import java.util.stream.Collectors;
 
 import static org.opensearch.index.engine.Engine.HISTORY_UUID_KEY;
 import static org.opensearch.index.engine.Engine.MAX_UNSAFE_AUTO_ID_TIMESTAMP_COMMIT_ID;
-import static org.opensearch.index.engine.exec.coord.CatalogSnapshot.CATALOG_SNAPSHOT_ID;
 import static org.opensearch.index.engine.exec.coord.CatalogSnapshot.CATALOG_SNAPSHOT_KEY;
 import static org.opensearch.index.engine.exec.coord.CatalogSnapshot.LAST_COMPOSITE_WRITER_GEN_KEY;
 
 @ExperimentalApi
 public class CompositeEngine implements LifecycleAware, Closeable, Indexer, CheckpointState, IndexingThrottler, StatsHolder {
+
 
     private static final Consumer<ReferenceManager.RefreshListener> PRE_REFRESH_LISTENER_CONSUMER = refreshListener -> {
         try {
@@ -141,10 +146,11 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
             throw new RuntimeException(e);
         }
     };
-    private static final BiConsumer<Supplier<ReleasableRef<CatalogSnapshot>>, CatalogSnapshotAwareRefreshListener>
-        POST_REFRESH_CATALOG_SNAPSHOT_AWARE_LISTENER_CONSUMER = (catalogSnapshot, catalogSnapshotAwareRefreshListener) -> {
+    private static final TriConsumer<Supplier<ReleasableRef<CatalogSnapshot>>, CatalogSnapshotAwareRefreshListener, Boolean>
+        POST_REFRESH_CATALOG_SNAPSHOT_AWARE_LISTENER_CONSUMER = (catalogSnapshot, catalogSnapshotAwareRefreshListener, didRefresh) -> {
         try {
-            catalogSnapshotAwareRefreshListener.afterRefresh(true, catalogSnapshot);
+            // Wrap in Supplier as required by CatalogSnapshotAwareRefreshListener interface
+            catalogSnapshotAwareRefreshListener.afterRefresh(didRefresh, catalogSnapshot);
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -152,9 +158,9 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
     private static final Function<String, String> extractSegmentName = name -> name.substring(name.lastIndexOf('_'), name.lastIndexOf('.'));
 
     private final ShardId shardId;
-    private final CompositeIndexingExecutionEngine engine;
-    private final EngineConfig engineConfig;
-    private final Store store;
+    protected final CompositeIndexingExecutionEngine engine;
+    protected final EngineConfig engineConfig;
+    protected final Store store;
     private final Logger logger;
     private final Committer compositeEngineCommitter;
     private final TranslogManager translogManager;
@@ -201,8 +207,12 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
     // An index request is considered as an update if it overwrites existing documents with the same docId in the Lucene index.
     // The value of this marker never goes backwards, and is tracked/updated differently on primary and replica.
     private final AtomicLong maxSeqNoOfUpdatesOrDeletes;
+
+    // Policy that controls sequence number retention for peer-recovery and querying history changes
+    private final SoftDeletesPolicy softDeletesPolicy;
+
     private final IndexingStrategyPlanner indexingStrategyPlanner;
-    private final CatalogSnapshotManager catalogSnapshotManager;
+    protected final CatalogSnapshotManager catalogSnapshotManager;
     private ReleasableRef<CatalogSnapshot> lastCommitedCatalogSnapshotRef;
     private final EventListener eventListener;
 
@@ -214,6 +224,19 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
         ShardPath shardPath,
         BiFunction<Long, Long, LocalCheckpointTracker> localCheckpointTrackerSupplier,
         TranslogEventListener translogEventListener
+    ) {
+        this(engineConfig, mapperService, pluginsService, indexSettings, shardPath, localCheckpointTrackerSupplier, translogEventListener, true);
+    }
+
+    public CompositeEngine(
+        EngineConfig engineConfig,
+        MapperService mapperService,
+        PluginsService pluginsService,
+        IndexSettings indexSettings,
+        ShardPath shardPath,
+        BiFunction<Long, Long, LocalCheckpointTracker> localCheckpointTrackerSupplier,
+        TranslogEventListener translogEventListener,
+        boolean deleteUnreferencedFiles
     ) {
         this.logger = Loggers.getLogger(CompositeEngine.class, engineConfig.getShardId());
         this.engineConfig = engineConfig;
@@ -233,9 +256,30 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
             this.localCheckpointTracker = createLocalCheckpointTracker(localCheckpointTrackerSupplier);
             this.lastRefreshedCheckpointListener = new LastRefreshedCheckpointListener(localCheckpointTracker);
             refreshListeners.add(lastRefreshedCheckpointListener);
+            Map<String, String> userData;
+            String translogUUID;
+            // Note: lastRefreshedCheckpointListener is initialized later after localCheckpointTracker is ready
+            try {
+                final SegmentInfos segmentInfos = store.readLastCommittedSegmentsInfo();
+                userData = segmentInfos.getUserData();
+                translogUUID = Objects.requireNonNull(userData.get(Translog.TRANSLOG_UUID_KEY));
+            } catch (java.io.FileNotFoundException e) {
+                // Local store is empty (remote store recovery scenario)
+                final Path translogPath = engineConfig.getTranslogConfig().getTranslogPath();
+                final Checkpoint checkpoint = Checkpoint.read(translogPath.resolve(Translog.CHECKPOINT_FILE_NAME));
+                final Path translogFile = translogPath.resolve(Translog.getFilename(checkpoint.getGeneration()));
+                try (java.nio.channels.FileChannel channel = java.nio.channels.FileChannel.open(translogFile, java.nio.file.StandardOpenOption.READ)) {
+                    final TranslogHeader translogHeader = TranslogHeader.read(translogFile, channel);
+                    translogUUID = translogHeader.getTranslogUUID();
 
-            final Map<String, String> userData = store.readLastCommittedSegmentsInfo().getUserData();
-            String translogUUID = Objects.requireNonNull(userData.get(Translog.TRANSLOG_UUID_KEY));
+                    // Create initial empty commit for LuceneCommitEngine
+                    store.createEmpty(engineConfig.getIndexSettings().getIndexVersionCreated().luceneVersion, translogUUID);
+
+                    // Now read the userData from the newly created commit
+                    userData = store.readLastCommittedSegmentsInfo().getUserData();
+                    logger.debug("Created initial empty commit with translog UUID: {}", translogUUID);
+                }
+            }
             TranslogEventListener internalTranslogEventListener = new TranslogEventListener() {
                 @Override
                 public void onAfterTranslogSync() {
@@ -267,7 +311,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
             this.translogManager = translogManagerRef;
 
             // initialize committer and composite indexing execution engine
-            committerRef = new LuceneCommitEngine(store, translogDeletionPolicy, translogManager::getLastSyncedGlobalCheckpoint);
+            committerRef = new LuceneCommitEngine(store, translogDeletionPolicy, translogManager::getLastSyncedGlobalCheckpoint, !config().isReadOnlyReplica());
             this.compositeEngineCommitter = committerRef;
             final AtomicLong lastCommittedWriterGeneration = new AtomicLong(-1);
             Map<String, String> lastCommittedData = this.compositeEngineCommitter.getLastCommittedData();
@@ -275,25 +319,42 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                 lastCommittedWriterGeneration.set(Long.parseLong(lastCommittedData.get(LAST_COMPOSITE_WRITER_GEN_KEY)));
             }
 
-            System.out.println("While initialising Composite Engine - lst commit generation : " + lastCommittedWriterGeneration.get());
-
-            // How to bring the Dataformat here? Currently, this means only Text and LuceneFormat can be used
+            logger.debug("While initialising Composite Engine - lst commit generation : " + lastCommittedWriterGeneration.get());
             this.engine = new CompositeIndexingExecutionEngine(
+                engineConfig,
                 mapperService,
                 pluginsService,
                 shardPath,
-                lastCommittedWriterGeneration.incrementAndGet()
+                lastCommittedWriterGeneration.incrementAndGet(),
+                indexSettings
             );
+            this.catalogSnapshotManager = new CatalogSnapshotManager(this, committerRef, shardPath, deleteUnreferencedFiles);
+            // How to bring the Dataformat here? Currently, this means only Text and LuceneFormat can be used
+
             //Initialize CatalogSnapshotManager before loadWriterFiles to ensure stale files are cleaned up before loading
-            this.catalogSnapshotManager = new CatalogSnapshotManager(this, committerRef, shardPath);
+
             try (CompositeEngine.ReleasableRef<CatalogSnapshot> catalogSnapshotReleasableRef = catalogSnapshotManager.acquireSnapshot()) {
-                this.engine.loadWriterFiles(catalogSnapshotReleasableRef.getRef());
+                CatalogSnapshot loadedSnapshot = catalogSnapshotReleasableRef.getRef();
+                this.engine.loadWriterFiles(loadedSnapshot);
+
+                if (loadedSnapshot != null) {
+                    long snapshotLastWriterGen = loadedSnapshot.getLastWriterGeneration();
+                    engine.updateWriterGenerationIfNeeded(snapshotLastWriterGen);
+                }
             } catch (Exception e) {
                 failEngine("unable to close releasable catalog snapshot while bootstrapping composite engine", e);
             }
 
             this.maxSeqNoOfUpdatesOrDeletes =
                 new AtomicLong(SequenceNumbers.max(localCheckpointTracker.getMaxSeqNo(), translogManager.getMaxSeqNo()));
+
+            softDeletesPolicy = newSoftDeletesPolicy();
+
+            // Wire up softDeletesPolicy to the CombinedDeletionPolicy so that onCommit
+            // correctly updates the safe commit checkpoint for peer recovery and translog trimming.
+            if (committerRef instanceof LuceneCommitEngine) {
+                ((LuceneCommitEngine) committerRef).setSoftDeletesPolicy(softDeletesPolicy);
+            }
 
             this.indexingStrategyPlanner = new IndexingStrategyPlanner(
                 engineConfig,
@@ -315,6 +376,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
 
             // Refresh here so that catalog snapshot gets initialized
             // TODO : any better way to do this ?
+            initializeRefreshListeners(engineConfig);
             refresh("start");
             // TODO : how to extend this for Lucene ? where engine is a r/w engine
             // Create read specific engines for each format which is associated with shard
@@ -322,8 +384,20 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
             for (SearchEnginePlugin searchEnginePlugin : searchEnginePlugins) {
                 for (DataFormat dataFormat : searchEnginePlugin.getSupportedFormats()) {
                     List<SearchExecEngine<?, ?, ?, ?>> currentSearchEngines = readEngines.getOrDefault(dataFormat, new ArrayList<>());
+
+                    // Get FileMetadata filtered by data format from current catalog snapshot
+                    Collection<FileMetadata> formatFiles;
+                    try (ReleasableRef<CatalogSnapshot> snapshotRef = acquireSnapshot()) {
+                        CatalogSnapshot snapshot = snapshotRef.getRef();
+                        formatFiles = snapshot.getFileMetadataList().stream()
+                            .filter(fm -> fm.dataFormat().equals(dataFormat.getName()))
+                            .collect(Collectors.toList());
+                    } catch (Exception e) {
+                        throw new EngineCreationFailureException(shardId, "failed to acquire catalog snapshot for read engine creation", e);
+                    }
+
                     SearchExecEngine<?, ?, ?, ?> newSearchEngine =
-                        searchEnginePlugin.createEngine(dataFormat, Collections.emptyList(), shardPath);
+                        searchEnginePlugin.createEngine(dataFormat, formatFiles, shardPath);
 
                     currentSearchEngines.add(newSearchEngine);
                     readEngines.put(dataFormat, currentSearchEngines);
@@ -344,10 +418,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                     }
                 }
             }
-            catalogSnapshotAwareRefreshListeners.forEach(refreshListener -> POST_REFRESH_CATALOG_SNAPSHOT_AWARE_LISTENER_CONSUMER.accept(
-                this::acquireSnapshot,
-                refreshListener
-            ));
+            invokeRefreshListeners(true);
             success = true;
         } catch (IOException | TranslogCorruptedException e) {
             throw new EngineCreationFailureException(shardId, "failed to create engine", e);
@@ -361,9 +432,6 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
             }
         }
         logger.trace("created new CompositeEngine");
-
-        initializeRefreshListeners(engineConfig);
-
     }
 
     private LocalCheckpointTracker createLocalCheckpointTracker(
@@ -371,11 +439,26 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
     ) throws IOException {
         final long maxSeqNo;
         final long localCheckpoint;
-        final SequenceNumbers.CommitInfo seqNoStats =
-            SequenceNumbers.loadSeqNoInfoFromLuceneCommit(store.readLastCommittedSegmentsInfo().getUserData().entrySet());
-        maxSeqNo = seqNoStats.maxSeqNo;
-        localCheckpoint = seqNoStats.localCheckpoint;
-        logger.trace("recovered maximum sequence number [{}] and local checkpoint [{}]", maxSeqNo, localCheckpoint);
+
+        try {
+            final SequenceNumbers.CommitInfo seqNoStats =
+                SequenceNumbers.loadSeqNoInfoFromLuceneCommit(store.readLastCommittedSegmentsInfo().getUserData().entrySet());
+            maxSeqNo = seqNoStats.maxSeqNo;
+            localCheckpoint = seqNoStats.localCheckpoint;
+            logger.trace("recovered maximum sequence number [{}] and local checkpoint [{}]", maxSeqNo, localCheckpoint);
+        } catch (org.apache.lucene.index.IndexNotFoundException e) {
+            // Local store is empty (remote store recovery scenario)
+            // Initialize with NO_OPS_PERFORMED (-1) - checkpoint will be restored from CatalogSnapshot during first flush
+            logger.debug(
+                "Local store is empty during engine initialization, initializing checkpoint tracker with NO_OPS_PERFORMED. "
+                + "This is expected during remote store recovery where local store has not been initialized yet."
+            );
+            return localCheckpointTrackerSupplier.apply(
+                SequenceNumbers.NO_OPS_PERFORMED,
+                SequenceNumbers.NO_OPS_PERFORMED
+            );
+        }
+
         return localCheckpointTrackerSupplier.apply(maxSeqNo, localCheckpoint);
     }
 
@@ -392,6 +475,11 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                 engineConfig.getIndexSettings().getTranslogRetentionTotalFiles()
             )
         );
+    }
+
+    public final EngineConfig config()
+    {
+        return engineConfig;
     }
 
     protected TranslogManager createTranslogManager(
@@ -423,12 +511,13 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
         }
     }
 
-    LocalCheckpointTracker getLocalCheckpointTracker() {
+    public LocalCheckpointTracker getLocalCheckpointTracker() {
         return localCheckpointTracker;
     }
 
+
     public void updateSearchEngine() throws IOException {
-        catalogSnapshotAwareRefreshListeners.forEach(ref -> {
+            catalogSnapshotAwareRefreshListeners.forEach(ref -> {
             try {
                 ref.afterRefresh(true, catalogSnapshotManager::acquireSnapshot);
             } catch (IOException e) {
@@ -532,6 +621,8 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                         index.documentInput.setSeqNo(index.seqNo());
                         index.documentInput.setPrimaryTerm(SeqNoFieldMapper.PRIMARY_TERM_NAME, index.primaryTerm());
                         index.documentInput.setVersion(1); // we are not supporting update in parquet
+                         logger.debug("[COMPOSITE_DEBUG] Indexing doc id=[{}] seqNo=[{}] primaryTerm=[{}] — writing to engine",
+                             index.id(), index.seqNo(), index.primaryTerm());
                         WriteResult writeResult = index.documentInput.addToWriter();
                         indexResult =
                             new Engine.IndexResult(writeResult.version(), index.primaryTerm(), index.seqNo(), writeResult.success());
@@ -655,9 +746,14 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
         return translogManager.getLastSyncedGlobalCheckpoint();
     }
 
+    /**
+     * Returns the minimum sequence number that is retained.
+     * Delegates to SoftDeletesPolicy which handles retention lock coordination and
+     * calculation based on retention leases, global checkpoint, and safe commit.
+     */
     @Override
     public long getMinRetainedSeqNo() {
-        return -1;
+        return softDeletesPolicy.getMinRetainedSeqNo();
     }
 
     @Override
@@ -718,9 +814,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
     }
 
     public synchronized void refresh(String source) throws EngineException {
-        logger.info("[REFRESH] Starting refresh with source: {}", source);
         final long localCheckpointBeforeRefresh = localCheckpointTracker.getProcessedCheckpoint();
-        logger.info("[REFRESH] Local checkpoint before refresh: {}", localCheckpointBeforeRefresh);
         boolean refreshed = false;
         try (CompositeEngine.ReleasableRef<CatalogSnapshot> catalogSnapshotReleasableRef = catalogSnapshotManager.acquireSnapshot()) {
             logger.info("[REFRESH] Acquired catalog snapshot, invoking pre-refresh listeners");
@@ -734,20 +828,14 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
             logger.info("[REFRESH] Calling engine.refresh()");
             RefreshResult refreshResult = engine.refresh(refreshInput);
             if (refreshResult != null) {
-                logger.info("[REFRESH] Engine refresh returned result, applying to catalog snapshot manager");
                 catalogSnapshotManager.applyRefreshResult(refreshResult);
                 refreshed = true;
-                logger.info("[REFRESH] Refresh result applied successfully, refreshed=true");
-            } else {
-                logger.info("[REFRESH] Engine refresh returned null, no refresh needed");
             }
 
-            logger.info("[REFRESH] Invoking refresh listeners with refreshed={}", refreshed);
             invokeRefreshListeners(refreshed);
 
             // Call checkpoint listener's afterRefresh to update refreshed checkpoint
             if (refreshed) {
-                logger.info("[REFRESH] Triggering possible merges after successful refresh");
                 triggerPossibleMerges(); // trigger merges
             }
         } catch (Exception ex) {
@@ -759,30 +847,22 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
             }
             throw new RefreshFailedEngineException(shardId, ex);
         }
-        
-        final long localCheckpointAfterRefresh = lastRefreshedCheckpoint();
-        logger.info("[REFRESH] Refresh completed - refreshed: {}, checkpoint before: {}, checkpoint after: {}", 
-                   refreshed, localCheckpointBeforeRefresh, localCheckpointAfterRefresh);
 
-        assert refreshed == false || localCheckpointAfterRefresh >= localCheckpointBeforeRefresh : "refresh checkpoint was not advanced; "
+        assert refreshed == false || lastRefreshedCheckpoint() >= localCheckpointBeforeRefresh : "refresh checkpoint was not advanced; "
             + "local_checkpoint="
             + localCheckpointBeforeRefresh
             + " refresh_checkpoint="
-            + localCheckpointAfterRefresh;
+            + lastRefreshedCheckpoint();
     }
 
     private void invokeRefreshListeners(boolean didRefresh) {
-        logger.info("[REFRESH] Invoking catalog snapshot aware refresh listeners, count: {}, didRefresh: {}", 
-                   catalogSnapshotAwareRefreshListeners.size(), didRefresh);
-        catalogSnapshotAwareRefreshListeners.forEach(refreshListener -> POST_REFRESH_CATALOG_SNAPSHOT_AWARE_LISTENER_CONSUMER.accept(
+        catalogSnapshotAwareRefreshListeners.forEach(refreshListener -> POST_REFRESH_CATALOG_SNAPSHOT_AWARE_LISTENER_CONSUMER.apply(
             this::acquireSnapshot,
-            refreshListener
+            refreshListener,
+            didRefresh
         ));
-        logger.info("[REFRESH] Catalog snapshot aware refresh listeners completed");
 
-        logger.info("[REFRESH] Invoking standard refresh listeners, count: {}", refreshListeners.size());
         refreshListeners.forEach(POST_REFRESH_LISTENER_CONSUMER);
-        logger.info("[REFRESH] Standard refresh listeners completed");
     }
 
     public synchronized void applyMergeChanges(MergeResult mergeResult, OneMerge oneMerge) {
@@ -790,9 +870,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
         try {
             logger.info("[MERGE] Applying merge results to catalog snapshot manager");
             catalogSnapshotManager.applyMergeResults(mergeResult, oneMerge);
-            logger.info("[MERGE] Merge results applied, invoking refresh listeners");
             invokeRefreshListeners(true);
-            logger.info("[MERGE] Merge changes applied successfully");
         } catch (Exception ex) {
             try {
                 logger.error(
@@ -813,11 +891,6 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
         logger.info("[MERGE] Triggering possible merges via merge scheduler");
         mergeScheduler.triggerMerges();
         logger.info("[MERGE] Merge trigger completed");
-    }
-
-    public void finalizeReplication(CatalogSnapshot catalogSnapshot, ShardPath shardPath) throws IOException {
-        catalogSnapshotManager.applyReplicationChanges(catalogSnapshot, shardPath);
-        updateSearchEngine();
     }
 
     // This should get wired into searcher acquireSnapshot for initializing reader context later
@@ -868,14 +941,33 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
         return null;
     }
 
+    /**
+     * Returns the number of history operations in the specified sequence number range.
+     * For CompositeEngine, history is tracked in translog since we don't maintain soft-deleted documents.
+     */
     @Override
     public int countNumberOfHistoryOperations(String source, long fromSeqNo, long toSeqNumber) throws IOException {
-        return 0;
+        ensureOpen();
+        // For CompositeEngine, count operations from translog since we don't have soft-deleted docs
+        try (Translog.Snapshot snapshot = translogManager.newChangesSnapshot(fromSeqNo, toSeqNumber, false)) {
+            int count = 0;
+            Translog.Operation op;
+            while ((op = snapshot.next()) != null) {
+                if (op.seqNo() >= fromSeqNo && op.seqNo() <= toSeqNumber) {
+                    count++;
+                }
+            }
+            return count;
+        }
     }
 
+    /**
+     * Returns true if this engine has all operations from the given starting sequence number.
+     * For CompositeEngine, this checks if the minimum retained sequence number is at or before the starting seq no.
+     */
     @Override
     public boolean hasCompleteOperationHistory(String reason, long startingSeqNo) {
-        return false;
+        return getMinRetainedSeqNo() <= startingSeqNo;
     }
 
     @Override
@@ -892,7 +984,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                 lastCommitedCatalogSnapshotRef.getRef()
                     .getSegments()
                     .stream()
-                    .map(CatalogSnapshot.Segment::getGeneration)
+                    .map(org.opensearch.index.engine.exec.coord.Segment::getGeneration)
                     .collect(Collectors.toCollection(() -> committedSegments));
             }
             Map<String, FileStats> segmentStats = getPrimaryReadEngine().fetchSegmentStats();
@@ -969,35 +1061,50 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
                 boolean shouldPeriodicallyFlush = shouldPeriodicallyFlush();
                 if (force || shouldFlush() || shouldPeriodicallyFlush || getProcessedLocalCheckpoint() > Long.parseLong(
                     readLastCommittedData().get(SequenceNumbers.LOCAL_CHECKPOINT_KEY))) {
+                    refresh("flush in composite engine");
                     translogManager.ensureCanFlush();
+
                     try {
                         translogManager.rollTranslogGeneration();
                         logger.trace("starting commit for flush; commitTranslog=true");
                         CompositeEngine.ReleasableRef<CatalogSnapshot> catalogSnapshotToFlushRef = catalogSnapshotManager.acquireSnapshot();
                         final CatalogSnapshot catalogSnapshotToFlush = catalogSnapshotToFlushRef.getRef();
-                        System.out.println("FLUSH called, current snapshot to commit : " + catalogSnapshotToFlush.getId()
-                            + ", previous commited snapshot : " + ((lastCommitedCatalogSnapshotRef != null)
-                                                                   ? lastCommitedCatalogSnapshotRef.getRef().getId()
-                                                                   : -1));
-                        final String serializedCatalogSnapshot = catalogSnapshotToFlush.serializeToString();
-                        final long lastWriterGeneration = catalogSnapshotToFlush.getLastWriterGeneration();
+
+                        // FIX: Use MAX of engine's current counter and snapshot's lastWriterGeneration
+                        // to ensure we never reuse a generation after restart.
+                        // Engine counter - 1 = last assigned generation (counter points to NEXT generation)
+                        final long engineLastAssignedGen = engine.getCurrentWriterGeneration() - 1;
+                        final long snapshotLastWriterGen = catalogSnapshotToFlush.getLastWriterGeneration();
+                        final long lastWriterGeneration = Math.max(engineLastAssignedGen, snapshotLastWriterGen);
+
                         final long localCheckpoint = localCheckpointTracker.getProcessedCheckpoint();
-                        final long id = catalogSnapshotToFlush.getId();
+
+                        // Create commitData with checkpoint information BEFORE serializing CatalogSnapshot
+                        // This ensures CatalogSnapshot.userData contains the correct checkpoint values
+                        final Map<String, String> commitData = new HashMap<>(8);
+                        commitData.put(Translog.TRANSLOG_UUID_KEY, translogManager.getTranslogUUID());
+                        commitData.put(SequenceNumbers.LOCAL_CHECKPOINT_KEY, Long.toString(localCheckpoint));
+                        commitData.put(SequenceNumbers.MAX_SEQ_NO, Long.toString(localCheckpointTracker.getMaxSeqNo()));
+                        commitData.put(MAX_UNSAFE_AUTO_ID_TIMESTAMP_COMMIT_ID, Long.toString(maxUnsafeAutoIdTimestamp.get()));
+                        commitData.put(HISTORY_UUID_KEY, historyUUID);
+                        commitData.put(LAST_COMPOSITE_WRITER_GEN_KEY, Long.toString(lastWriterGeneration));
+                        // Persist MIN_RETAINED_SEQNO to enable proper restoration after restart
+                        commitData.put(Engine.MIN_RETAINED_SEQNO, Long.toString(softDeletesPolicy.getMinRetainedSeqNo()));
+
+                        // Copy checkpoint data to CatalogSnapshot.userData BEFORE serialization
+                        // This preserves checkpoint state for recovery scenarios (e.g., replica promotion)
+                        catalogSnapshotToFlush.setUserData(commitData, false);
+
+                        // Now serialize CatalogSnapshot with checkpoint data in userData
+                        final String serializedCatalogSnapshot = catalogSnapshotToFlush.serializeToString();
+                        commitData.put(CATALOG_SNAPSHOT_KEY, serializedCatalogSnapshot);
+
                         compositeEngineCommitter.commit(
-                            () -> {
-                                final Map<String, String> commitData = new HashMap<>(7);
-                                commitData.put(CATALOG_SNAPSHOT_ID, Long.toString(id));
-                                commitData.put(Translog.TRANSLOG_UUID_KEY, translogManager.getTranslogUUID());
-                                commitData.put(SequenceNumbers.LOCAL_CHECKPOINT_KEY, Long.toString(localCheckpoint));
-                                commitData.put(SequenceNumbers.MAX_SEQ_NO, Long.toString(localCheckpointTracker.getMaxSeqNo()));
-                                commitData.put(MAX_UNSAFE_AUTO_ID_TIMESTAMP_COMMIT_ID, Long.toString(maxUnsafeAutoIdTimestamp.get()));
-                                commitData.put(HISTORY_UUID_KEY, historyUUID);
-                                commitData.put(CATALOG_SNAPSHOT_KEY, serializedCatalogSnapshot);
-                                commitData.put(LAST_COMPOSITE_WRITER_GEN_KEY, Long.toString(lastWriterGeneration));
-                                return commitData.entrySet().iterator();
-                            }, catalogSnapshotToFlush
+                            () -> commitData.entrySet().iterator(),
+                            catalogSnapshotToFlush
                         );
                         logger.trace("finished commit for flush");
+
                         if (lastCommitedCatalogSnapshotRef != null && lastCommitedCatalogSnapshotRef.getRef() != null)
                             lastCommitedCatalogSnapshotRef.close();
                         lastCommitedCatalogSnapshotRef = catalogSnapshotToFlushRef;
@@ -1086,6 +1193,8 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
     @Override
     public void onSettingsChanged(TimeValue translogRetentionAge, ByteSizeValue translogRetentionSize, long softDeletesRetentionOps) {
         mergeScheduler.refreshConfig();
+        // Update soft deletes retention operations when settings change
+        softDeletesPolicy.setRetentionOperations(softDeletesRetentionOps);
     }
 
     @Override
@@ -1107,14 +1216,45 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
         return compositeEngineCommitter.getSafeCommitInfo();
     }
 
+    /**
+     * Creates a new SoftDeletesPolicy, loading minRetainedSeqNo from commit data to preserve across restarts.
+     * This is critical for proper peer recovery and retention lease handling.
+     */
+    private SoftDeletesPolicy newSoftDeletesPolicy() {
+        final Map<String, String> commitUserData = readLastCommittedData();
+        final long lastMinRetainedSeqNo;
+        if (commitUserData.containsKey(Engine.MIN_RETAINED_SEQNO)) {
+            lastMinRetainedSeqNo = Long.parseLong(commitUserData.get(Engine.MIN_RETAINED_SEQNO));
+        } else if (commitUserData.containsKey(SequenceNumbers.MAX_SEQ_NO)) {
+            // If MIN_RETAINED_SEQNO is not present but MAX_SEQ_NO is, use max_seq_no + 1
+            // This is the same behavior as InternalEngine for backward compatibility
+            lastMinRetainedSeqNo = Long.parseLong(commitUserData.get(SequenceNumbers.MAX_SEQ_NO)) + 1;
+        } else {
+            // No commit data available (fresh index), start with NO_OPS_PERFORMED
+            lastMinRetainedSeqNo = SequenceNumbers.NO_OPS_PERFORMED;
+        }
+        return new SoftDeletesPolicy(
+            translogManager::getLastSyncedGlobalCheckpoint,
+            lastMinRetainedSeqNo,
+            engineConfig.getIndexSettings().getSoftDeleteRetentionOperations(),
+            engineConfig.retentionLeasesSupplier()
+        );
+    }
+
     @Override
     public TranslogManager translogManager() {
         return translogManager;
     }
 
+    /**
+     * Acquires a lock on history retention to prevent trimming of translog operations needed for peer recovery.
+     * Delegates to SoftDeletesPolicy which handles the retention lock coordination.
+     * When held, it prevents minRetainedSeqNo from advancing, ensuring that all operations after the safe commit's
+     * local checkpoint will be retained for the duration of the recovery.
+     */
     @Override
     public Closeable acquireHistoryRetentionLock() {
-        return null;
+        return softDeletesPolicy.acquireRetentionLock();
     }
 
     @Override
@@ -1125,7 +1265,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
         boolean requiredFullRange,
         boolean accurateCount
     ) throws IOException {
-        return null;
+        return translogManager.newChangesSnapshot(fromSeqNo, toSeqNo, requiredFullRange);
     }
 
     @Override
@@ -1187,7 +1327,7 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
         return engineFailed;
     }
 
-    private boolean maybeFailEngine(String source, Exception e) {
+    protected boolean maybeFailEngine(String source, Exception e) {
         // Check for AlreadyClosedException -- ACE is a very special
         // exception that should only be thrown in a tragic event. we pass on the checks to failOnTragicEvent which will
         // throw and AssertionError if the tragic event condition is not met.
@@ -1266,34 +1406,33 @@ public class CompositeEngine implements LifecycleAware, Closeable, Indexer, Chec
      * called while the write lock is hold or in a disaster condition ie. if the engine
      * is failed.
      */
-    private void closeNoLock(String reason, CountDownLatch closedLatch) {
+    protected void closeNoLock(String reason, CountDownLatch closedLatch) {
         if (isClosed.compareAndSet(false, true)) {
             assert rwl.isWriteLockedByCurrentThread()
                 || failEngineLock.isHeldByCurrentThread() : "Either the write lock must be held or the engine must be currently be failing itself";
             try {
-                try {
                     IOUtils.close(engine, translogManager, compositeEngineCommitter);
                 } catch (Exception e) {
                     logger.warn("Failed to close translog", e);
-                }
-            } catch (Exception e) {
-                logger.warn("failed to close translog manager", e);
-            } finally {
-                try {
-                    store.decRef();
-                    logger.debug("engine closed [{}]", reason);
                 } finally {
-                    closedLatch.countDown();
+                    try {
+                        store.decRef();
+                        logger.debug("engine closed [{}]", reason);
+                    } finally {
+                        closedLatch.countDown();
+                    }
                 }
-            }
         }
     }
+
+
 
     /**
      * Acquires the most recent safe index commit snapshot from the currently running engine.
      * All index files referenced by this commit won't be freed until the commit/snapshot is closed.
      * This method is required for replica recovery operations.
      */
+    @Override
     public GatedCloseable<IndexCommit> acquireSafeIndexCommit() throws EngineException {
         ensureOpen();
         if (compositeEngineCommitter instanceof LuceneCommitEngine) {

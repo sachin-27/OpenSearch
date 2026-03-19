@@ -33,6 +33,7 @@ package org.opensearch.index;
 
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.MergePolicy;
+import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.sandbox.index.MergeOnFlushMergePolicy;
 import org.opensearch.Version;
 import org.opensearch.cluster.metadata.IndexMetadata;
@@ -56,6 +57,7 @@ import org.opensearch.indices.replication.common.ReplicationType;
 import org.opensearch.ingest.IngestService;
 import org.opensearch.node.Node;
 import org.opensearch.node.remotestore.RemoteStoreNodeAttribute;
+import org.opensearch.search.SearchService;
 import org.opensearch.search.pipeline.SearchPipelineService;
 
 import java.util.Arrays;
@@ -80,6 +82,12 @@ import static org.opensearch.search.SearchService.CONCURRENT_SEGMENT_SEARCH_MIN_
 import static org.opensearch.search.SearchService.CONCURRENT_SEGMENT_SEARCH_MODE_ALL;
 import static org.opensearch.search.SearchService.CONCURRENT_SEGMENT_SEARCH_MODE_AUTO;
 import static org.opensearch.search.SearchService.CONCURRENT_SEGMENT_SEARCH_MODE_NONE;
+import static org.opensearch.search.SearchService.NATIVE_CONCURRENT_SEGMENT_SEARCH_DEFAULT_SLICE_COUNT_VALUE;
+import static org.opensearch.search.SearchService.NATIVE_CONCURRENT_SEGMENT_SEARCH_MAX_SLICE_COUNT_VALUE;
+import static org.opensearch.search.SearchService.NATIVE_CONCURRENT_SEGMENT_SEARCH_MIN_SLICE_COUNT_VALUE;
+import static org.opensearch.search.SearchService.NATIVE_CONCURRENT_SEGMENT_SEARCH_MODE_ALL;
+import static org.opensearch.search.SearchService.NATIVE_CONCURRENT_SEGMENT_SEARCH_MODE_NONE;
+import static org.opensearch.search.SearchService.NATIVE_CONCURRENT_SEGMENT_SEARCH_TARGET_MAX_SLICE_COUNT_SETTING;
 
 /**
  * This class encapsulates all index level settings and handles settings updates.
@@ -739,6 +747,33 @@ public final class IndexSettings {
         Property.IndexScope
     );
 
+
+    public static final Setting<String> OPTIMIZED_INDEX_CONCURRENT_SEGMENT_SEARCH_MODE = Setting.simpleString(
+        "index.optimized.search.concurrent_segment_search.mode",
+        NATIVE_CONCURRENT_SEGMENT_SEARCH_MODE_NONE,
+        value -> {
+            switch (value) {
+                case NATIVE_CONCURRENT_SEGMENT_SEARCH_MODE_ALL:
+                case NATIVE_CONCURRENT_SEGMENT_SEARCH_MODE_NONE:
+                    // valid setting
+                    break;
+                default:
+                    throw new IllegalArgumentException("Setting value must be one of [all, none, auto]");
+            }
+        },
+        Property.Dynamic,
+        Property.IndexScope
+    );
+
+    public static final Setting<Integer> OPTIMIZED_INDEX_CONCURRENT_SEGMENT_SEARCH_MAX_SLICE_COUNT = Setting.intSetting(
+        "index.optimized.search.concurrent.max_slice_count",
+        NATIVE_CONCURRENT_SEGMENT_SEARCH_DEFAULT_SLICE_COUNT_VALUE,
+        NATIVE_CONCURRENT_SEGMENT_SEARCH_MIN_SLICE_COUNT_VALUE,
+        NATIVE_CONCURRENT_SEGMENT_SEARCH_MAX_SLICE_COUNT_VALUE,
+        Property.Dynamic,
+        Property.IndexScope
+    );
+
     public static final Setting<Boolean> INDEX_DOC_ID_FUZZY_SET_ENABLED_SETTING = Setting.boolSetting(
         "index.optimize_doc_id_lookup.fuzzy_set.enabled",
         false,
@@ -827,6 +862,29 @@ public final class IndexSettings {
         false,
         Property.IndexScope,
         Property.Final
+    );
+
+    /**
+     * Declares which data format is primary for a composite index.
+     * Required when multiple DataSourcePlugins are registered.
+     * Defaults to "parquet".
+     */
+    public static final Setting<String> INDEX_COMPOSITE_PRIMARY_DATA_FORMAT_SETTING = Setting.simpleString(
+        "index.composite.primary_data_format",
+        "parquet",
+        Property.IndexScope
+    );
+
+    /**
+     * Declares which data formats are secondary for a composite index.
+     * Only plugins whose data format name appears in this list (or matches the primary)
+     * will be registered. Defaults to an empty list (all non-primary plugins are allowed).
+     */
+    public static final Setting<List<String>> INDEX_COMPOSITE_SECONDARY_DATA_FORMATS_SETTING = Setting.listSetting(
+        "index.composite.secondary_data_formats",
+        Collections.emptyList(),
+        s -> s,
+        Property.IndexScope
     );
 
     private final Index index;

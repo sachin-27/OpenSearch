@@ -9,31 +9,24 @@
 package com.parquet.parquetdataformat.vsr;
 
 import com.parquet.parquetdataformat.bridge.ArrowExport;
-import com.parquet.parquetdataformat.bridge.RustBridge;
+import com.parquet.parquetdataformat.bridge.ParquetFileMetadata;
 import com.parquet.parquetdataformat.memory.ArrowBufferPool;
 import com.parquet.parquetdataformat.writer.ParquetDocumentInput;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.IntVector;
-import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.types.Types;
+import org.opensearch.index.engine.exec.EngineRole;
 import org.opensearch.index.engine.exec.FlushIn;
 import org.opensearch.index.engine.exec.WriteResult;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.common.settings.Settings;
-import org.mockito.MockedStatic;
 import org.mockito.Mockito;
 
 import java.util.Arrays;
-import java.util.HashMap;
-import java.util.Map;
-
-import static org.mockito.ArgumentMatchers.anyLong;
-import static org.mockito.ArgumentMatchers.anyString;
 
 /**
  * Integration tests for VSRManager covering document processing workflows and state management
@@ -90,8 +83,8 @@ public class VSRManagerTests extends OpenSearchTestCase {
 
         // Flush before close (transitions VSR to FROZEN)
         FlushIn flushIn = Mockito.mock(FlushIn.class);
-        String flushResult = vsrManager.flush(flushIn);
-        assertEquals("Flush should return filename", testFileName, flushResult);
+        ParquetFileMetadata flushResult = vsrManager.flush(flushIn);
+        assertNotNull("Flush should return metadata", flushResult);
         assertEquals("VSR should be FROZEN after flush", VSRState.FROZEN, vsrManager.getActiveManagedVSR().getState());
 
         // Now close should succeed
@@ -103,7 +96,7 @@ public class VSRManagerTests extends OpenSearchTestCase {
         VSRManager vsrManager = new VSRManager(testFileName, testSchema, bufferPool);
 
         // Create a document to add
-        ParquetDocumentInput document = new ParquetDocumentInput(vsrManager.getActiveManagedVSR());
+        ParquetDocumentInput document = new ParquetDocumentInput(vsrManager.getActiveManagedVSR(), EngineRole.PRIMARY);
 
         // Create mock field types and add fields to document
         MappedFieldType idFieldType = Mockito.mock(MappedFieldType.class);
@@ -125,8 +118,8 @@ public class VSRManagerTests extends OpenSearchTestCase {
         // Follow proper VSRManager lifecycle: Write → Flush → Close
         // Flush before close (transitions VSR to FROZEN)
         FlushIn flushIn = Mockito.mock(FlushIn.class);
-        String flushResult = vsrManager.flush(flushIn);
-        assertEquals("Flush should return filename", testFileName, flushResult);
+        ParquetFileMetadata flushResult = vsrManager.flush(flushIn);
+        assertNotNull("Flush should return metadata", flushResult);
         assertEquals("VSR should be FROZEN after flush", VSRState.FROZEN, vsrManager.getActiveManagedVSR().getState());
 
         // Now close should succeed
@@ -142,9 +135,9 @@ public class VSRManagerTests extends OpenSearchTestCase {
 
         // Flush through VSRManager (create mock FlushIn)
         FlushIn flushIn = Mockito.mock(FlushIn.class);
-        String result = vsrManager.flush(flushIn);
+        ParquetFileMetadata result = vsrManager.flush(flushIn);
 
-        assertEquals("Flush should return filename", testFileName, result);
+        assertNotNull("Flush should return metadata", result);
 
         // VSR should be FROZEN after flush
         assertEquals("VSR should be FROZEN after flush",
@@ -166,9 +159,9 @@ public class VSRManagerTests extends OpenSearchTestCase {
 
         // 3. Flush - should transition VSR to FROZEN
         FlushIn flushIn = Mockito.mock(FlushIn.class);
-        String flushResult = vsrManager.flush(flushIn);
+        ParquetFileMetadata flushResult = vsrManager.flush(flushIn);
 
-        assertEquals("Flush should return filename", testFileName, flushResult);
+        assertNotNull("Flush should return metadata", flushResult);
         assertEquals("VSR should be FROZEN after flush", VSRState.FROZEN, vsrManager.getActiveManagedVSR().getState());
         assertTrue("VSR should be immutable when frozen", vsrManager.getActiveManagedVSR().isImmutable());
 

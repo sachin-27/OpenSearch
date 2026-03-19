@@ -85,7 +85,7 @@ validateNebulaPom.enabled = false
 // }
 
   ext {
-    opensearch_version = System.getProperty("opensearch.version", "3.3.0-SNAPSHOT")
+    opensearch_version = System.getProperty("opensearch.version", "3.3.0")
   }
 
 repositories {
@@ -150,11 +150,11 @@ dependencies {
   implementation project(':libs:opensearch-vectorized-exec-spi')
 
   // Apache Arrow dependencies (using stable version with unsafe allocator)
-  implementation 'org.apache.arrow:arrow-vector:17.0.0'
-  implementation 'org.apache.arrow:arrow-memory-core:17.0.0'
-  implementation 'org.apache.arrow:arrow-memory-unsafe:17.0.0'
-  implementation 'org.apache.arrow:arrow-format:17.0.0'
-  implementation 'org.apache.arrow:arrow-c-data:17.0.0'
+  implementation 'org.apache.arrow:arrow-vector:18.3.0'
+  implementation 'org.apache.arrow:arrow-memory-core:18.3.0'
+  implementation 'org.apache.arrow:arrow-memory-unsafe:18.3.0'
+  implementation 'org.apache.arrow:arrow-format:18.3.0'
+  implementation 'org.apache.arrow:arrow-c-data:18.3.0'
 
   // Checker Framework annotations (required by Arrow)
   implementation 'org.checkerframework:checker-qual:3.42.0'
@@ -183,7 +183,7 @@ dependencies {
 
   // Netty4 transport for HTTP in tests
   testImplementation project(':modules:transport-netty4')
-  
+
   // DataFusion plugin for internalClusterTest
   internalClusterTestImplementation project(':plugins:engine-datafusion')
 
@@ -232,23 +232,23 @@ integTest {
 
 testClusters.integTest {
   testDistribution = "INTEG_TEST"
-  
+
   // Configure 2 nodes for replication testing
   numberOfNodes = 2
-  
+
   // Whitelist repository path
   setting 'path.repo', "${buildDir}/testclusters/integTest-remote-store"
-  
+
   // Configure remote store node attributes
   setting 'node.attr.remote_store.segment.repository', 'test-rs-repo'
   setting 'node.attr.remote_store.translog.repository', 'test-rs-repo'
   setting 'node.attr.remote_store.state.repository', 'test-rs-repo'
-  
+
   // Configure remote store repository type and location
   setting 'node.attr.remote_store.repository.test-rs-repo.type', 'fs'
   setting 'node.attr.remote_store.repository.test-rs-repo.settings.location', "${buildDir}/testclusters/integTest-remote-store"
   setting 'node.attr.remote_store.repository.test-rs-repo.settings.system_repository', 'false'
-  
+
   // Enable debug logging for replication
   setting 'logger.org.opensearch.indices.replication', 'DEBUG'
   setting 'logger.org.opensearch.index.shard.RemoteStoreRefreshListener', 'DEBUG'
@@ -346,15 +346,12 @@ tasks.register('buildRust', Exec) {
 
   workingDir = file("${projectDir}/src/main/rust")
 
-  // Determine the target directory and library name based on OS
   def osName = System.getProperty('os.name').toLowerCase()
   def libPrefix = osName.contains('windows') ? '' : 'lib'
   def libExtension = osName.contains('windows') ? '.dll' : (osName.contains('mac') ? '.dylib' : '.so')
+  def libName = 'parquet_dataformat_jni'
 
-  // Use debug build for development, release for production
-  def targetDir = file("${workingDir}/target/")
-
-  // Find cargo executable - try common locations
+  // Find cargo executable
   def cargoExecutable = 'cargo'
   def possibleCargoPaths = [
           System.getenv('HOME') + '/.cargo/bin/cargo',
@@ -374,18 +371,13 @@ tasks.register('buildRust', Exec) {
     cargoArgs.add('--release')
   }
 
-  if (osName.contains('windows')) {
-    commandLine cargoArgs
-  } else {
-    commandLine cargoArgs
-  }
-
-  // Set environment variables for cross-compilation if needed
-  environment 'CARGO_TARGET_DIR', targetDir.absolutePath
+  commandLine cargoArgs
 
   inputs.files fileTree("${workingDir}/src")
   inputs.file "${workingDir}/Cargo.toml"
-  outputs.files file("jni/${targetDir}/${libPrefix}opensearch_datafusion_jni${libExtension}")
+
+  def outputDir = file("${workingDir}/target/${buildType}")
+  outputs.file file("${outputDir}/${libPrefix}${libName}${libExtension}")
   System.out.println("Building Parquet plugin rust library in ${buildType} mode");
 
 }
@@ -426,14 +418,14 @@ tasks.register('copyNativeLib', Copy) {
 
 // Enhanced clean task to remove native build artifacts
 clean {
-    doFirst {
-        delete fileTree('src/main/resources/native') {
-            exclude '.gitkeep' // Keep any gitkeep files if they exist
-        }
-        delete 'src/main/rust/target'
-        delete "src/main/resources/native"
-        println "Cleaned native build artifacts: src/main/resources/native and src/main/rust/target"
+  doFirst {
+    delete fileTree('src/main/resources/native') {
+      exclude '.gitkeep' // Keep any gitkeep files if they exist
     }
+    delete 'src/main/rust/target'
+    delete "src/main/resources/native"
+    println "Cleaned native build artifacts: src/main/resources/native and src/main/rust/target"
+  }
 }
 
 // Wire Rust build tasks into the Gradle build lifecycle

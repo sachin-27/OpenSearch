@@ -1,4 +1,8 @@
 use std::cell::RefCell;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 /*
@@ -14,7 +18,7 @@ use jni::objects::JLongArray;
 use jni::sys::{jboolean, jbyteArray, jint, jlong, jstring};
 use jni::{JNIEnv, JavaVM};
 use std::sync::{Arc, OnceLock};
-use arrow_array::{Array, StructArray};
+use arrow_array::{Array, RecordBatch, StructArray};
 use arrow_array::ffi::FFI_ArrowArray;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use datafusion::{
@@ -356,7 +360,49 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_getVersio
         .as_raw()
 }
 
+/// Test JNI method to verify FFI boundary handling of sliced arrays.
+/// Creates a sliced StringArray (simulating `head X from Y`) and returns FFI pointers.
+#[no_mangle]
+pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_createTestSlicedArray(
+    mut env: JNIEnv,
+    _class: JClass,
+    offset: jint,
+    length: jint,
+    listener: JObject,
+) {
+    use arrow_schema::{Schema, Field, DataType};
+    use arrow_array::StringArray;
 
+    let original = StringArray::from(vec!["zero", "one", "two", "three", "four"]);
+    let sliced = original.slice(offset as usize, length as usize);
+
+    let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(sliced)]).unwrap();
+
+    let struct_array: StructArray = batch.into();
+    let array_data = struct_array.to_data();
+
+    let ffi_schema = FFI_ArrowSchema::try_from(array_data.data_type()).unwrap();
+    let schema_ptr = Box::into_raw(Box::new(ffi_schema)) as i64;
+
+    let ffi_array = FFI_ArrowArray::new(&array_data);
+    let array_ptr = Box::into_raw(Box::new(ffi_array)) as i64;
+
+    let result = env.new_long_array(2).unwrap();
+    env.set_long_array_region(&result, 0, &[schema_ptr, array_ptr]).unwrap();
+
+    let listener_class = env.get_object_class(&listener).unwrap();
+    let on_response = env.get_method_id(&listener_class, "onResponse", "(Ljava/lang/Object;)V").unwrap();
+
+    unsafe {
+        env.call_method_unchecked(
+            &listener,
+            on_response,
+            jni::signature::ReturnType::Primitive(jni::signature::Primitive::Void),
+            &[jni::objects::JValue::Object(&result).as_jni()]
+        ).unwrap();
+    }
+}
 
 #[no_mangle]
 pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_createDatafusionReader(
@@ -533,6 +579,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeQu
     table_name: JString,
     substrait_bytes: jbyteArray,
     is_query_plan_explain_enabled: jboolean,
+    target_partitions: jint,
     runtime_ptr: jlong,
     listener: JObject,
 ) {
@@ -560,6 +607,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeQu
 
     log_info!("[FLOW] Query phase: tableName={}, explainEnabled={}", table_name, is_query_plan_explain_enabled != 0);
     let is_query_plan_explain_enabled: bool = is_query_plan_explain_enabled !=0;
+    let target_partitions: usize = target_partitions as usize;
 
     let plan_bytes_obj = unsafe { JByteArray::from_raw(substrait_bytes) };
     let plan_bytes_vec = match env.convert_byte_array(plan_bytes_obj) {
@@ -674,6 +722,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeQu
             table_name,
             plan_bytes_vec,
             is_query_plan_explain_enabled,
+            target_partitions,
             runtime,
             cpu_executor,
         ).await;
@@ -745,7 +794,6 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_fetchSegm
         }
     });
 }
-
 
 #[no_mangle]
 pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_streamNext(
@@ -1157,6 +1205,7 @@ pub extern "system" fn Java_org_opensearch_datafusion_jni_NativeBridge_executeQu
                     table_name,
                     plan_bytes_vec,
                     is_query_plan_explain_enabled,
+                    num_cpus::get(),
                     runtime,
                     cpu_executor,
                 ).await;

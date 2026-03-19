@@ -58,17 +58,20 @@ num_cpus = "1.16"
 
 
 # Object store for file access
-object_store = { workspace = true }
+object_store = { workspace = true, features = ["aws"] }
 url = { workspace = true }
+
+# Liquid Cache for byte-level caching
+liquid-cache-datafusion-local = { workspace = true }
 
 # Substrait support
 substrait = { workspace = true }
 
-# Iceberg integration
-iceberg = "0.8.0"
-iceberg-datafusion = "0.8.0"
-iceberg-catalog-glue = "0.8.0"
-iceberg-catalog-s3tables = "0.8.0"
+# Iceberg integration - using git main branch to get datafusion 52.x support
+iceberg = { git = "https://github.com/apache/iceberg-rust.git", branch = "main" }
+iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust.git", branch = "main" }
+iceberg-catalog-glue = { git = "https://github.com/apache/iceberg-rust.git", branch = "main" }
+iceberg-catalog-s3tables = { git = "https://github.com/apache/iceberg-rust.git", branch = "main" }
 
 # AWS SDK for role assumption
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }
@@ -87,6 +90,7 @@ once_cell = { workspace = true }
 tokio-stream = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
+mimalloc = { version = "0.1.48", default-features = false }
 
 [build-dependencies]
 cbindgen = "0.27"

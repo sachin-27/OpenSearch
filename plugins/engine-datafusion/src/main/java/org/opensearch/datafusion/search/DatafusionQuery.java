@@ -26,6 +26,7 @@ public class DatafusionQuery {
     private List<String> includeFields;
     private List<String> excludeFields;
     private Boolean isQueryPlanExplainEnabled;
+    private int targetPartitionsCount;
 
     // S3 partition download configuration
     private Boolean useDownloadedPartition;
@@ -42,6 +43,7 @@ public class DatafusionQuery {
         this.searchExecutors = searchExecutors;
         this.isFetchPhase = false;
         this.isQueryPlanExplainEnabled = false;
+        this.targetPartitionsCount = 1;
         this.useDownloadedPartition = false;
     }
 
@@ -59,9 +61,15 @@ public class DatafusionQuery {
         isQueryPlanExplainEnabled = queryPlanExplainEnabled;
     }
 
+    public void setTargetPartitionsCount(int targetPartitionsCount) {
+        this.targetPartitionsCount = targetPartitionsCount;
+    }
+
     public boolean getQueryPlanExplainEnabled() {
        return isQueryPlanExplainEnabled;
     }
+
+    public int getTargetPartitionsCount() { return this.targetPartitionsCount; }
 
     public boolean isFetchPhase() {
         return this.isFetchPhase;

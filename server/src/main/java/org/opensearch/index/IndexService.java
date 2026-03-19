@@ -84,6 +84,7 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.index.query.SearchIndexNameMatcher;
 import org.opensearch.index.remote.RemoteStoreStatsTrackerFactory;
+import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.seqno.RetentionLeaseSyncer;
 import org.opensearch.index.shard.IndexEventListener;
 import org.opensearch.index.shard.IndexShard;
@@ -719,7 +720,8 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                         this.indexSettings.getUUID(),
                         shardId,
                         this.indexSettings.getRemoteStorePathStrategy(),
-                        this.indexSettings.getRemoteStoreSegmentPathPrefix()
+                        this.indexSettings.getRemoteStoreSegmentPathPrefix(),
+                        RemoteStoreUtils.isServerSideEncryptionEnabledIndex(this.indexSettings.getIndexMetadata())
                     );
                 }
                 // When an instance of Store is created, a shardlock is created which is released on closing the instance of store.
@@ -736,7 +738,9 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                         // Do nothing for shard lock on remote store
                     }
                 };
-                CompositeStoreDirectory remoteCompositeStoreDirectory = createCompositeStoreDirectory(path);
+                CompositeStoreDirectory remoteCompositeStoreDirectory = this.indexSettings.isOptimizedIndex()
+                    ? createCompositeStoreDirectory(shardId, path)
+                    : null;
                 remoteStore = new Store(shardId, this.indexSettings, remoteDirectory, remoteStoreLock, Store.OnClose.EMPTY, path, remoteCompositeStoreDirectory);
             } else {
                 // Disallow shards with remote store based settings to be created on non-remote store enabled nodes
@@ -767,7 +771,9 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
                 directory = directoryFactory.newDirectory(this.indexSettings, path);
             }
 
-            CompositeStoreDirectory compositeStoreDirectory = createCompositeStoreDirectory(path);
+            CompositeStoreDirectory compositeStoreDirectory = this.indexSettings.isOptimizedIndex()
+                ? createCompositeStoreDirectory(shardId, path)
+                : null;
 
             store = new Store(
                 shardId,
@@ -822,11 +828,6 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
             );
             eventListener.indexShardStateChanged(indexShard, null, indexShard.state(), "shard created");
             eventListener.afterIndexShardCreated(indexShard);
-
-            // ToDO:@Kamal, Discuss a better place for it's initialization,
-            // Complete CompositeEngine initialization after remote store stats trackers have been created
-            // This ensures that RemoteStoreRefreshListener gets a non-null segmentTracker
-            // indexShard.completeCompositeEngineInitialization();
 
             shards = newMapBuilder(shards).put(shardId.id(), indexShard).immutableMap();
             success = true;
@@ -1366,11 +1367,12 @@ public class IndexService extends AbstractIndexComponent implements IndicesClust
      * Creates CompositeStoreDirectory using the factory if available, otherwise fallback to Store's internal creation.
      * This method centralizes the directory creation logic and enables plugin-based format discovery.
      */
-    private CompositeStoreDirectory createCompositeStoreDirectory(ShardPath shardPath) throws IOException {
+    private CompositeStoreDirectory createCompositeStoreDirectory(ShardId shardId, ShardPath shardPath) throws IOException {
         if (compositeStoreDirectoryFactory != null) {
             logger.debug("Using CompositeStoreDirectoryFactory to create directory for shard path: {}", shardPath);
             return compositeStoreDirectoryFactory.newCompositeStoreDirectory(
                 indexSettings,
+                shardId,
                 shardPath,
                 pluginsService
             );

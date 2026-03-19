@@ -38,6 +38,7 @@ public final class NativeBridge {
     public static native void shutdownTokioRuntimeManager();
 
     // Query execution
+    public static native void executeQueryPhaseAsync(long readerPtr, String tableName, byte[] plan, boolean isQueryPlanExplainEnabled, int partitionCount, long runtimePtr, ActionListener<Long> listener);
     public static native void executeQueryPhaseAsync(long readerPtr, String tableName, byte[] plan, boolean isQueryPlanExplainEnabled, long runtimePtr, ActionListener<Long> listener);
     public static native void executeQueryWithDownloadedPartitionAsync(String localDir, String tableBucketArn, String databaseName, String tableName, String partitionColumn, String partitionValue, Map<String, String> s3Options, byte[] plan, boolean isQueryPlanExplainEnabled, long runtimePtr, ActionListener<Long> listener);
     public static native long executeFetchPhase(long readerPtr, long[] rowIds, String[] includeFields, String[] excludeFields, long runtimePtr);
@@ -78,4 +79,10 @@ public final class NativeBridge {
 
     // Other methods
     public static native String getVersionInfo();
+
+    /**
+     * Test method: Creates a sliced StringArray and returns FFI pointers.
+     * Used to verify that sliced arrays across FFI boundary are handled correctly
+     **/
+    public static native void createTestSlicedArray(int offset, int length, ActionListener<long[]> listener);
 }

@@ -807,6 +807,8 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_PINNED_TIMESTAMP_ENABLED,
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_SEGMENTS_PATH_PREFIX,
                 RemoteStoreSettings.CLUSTER_REMOTE_STORE_TRANSLOG_PATH_PREFIX,
+                // Server Side encryption enabled
+                RemoteStoreSettings.CLUSTER_SERVER_SIDE_ENCRYPTION_ENABLED,
 
                 // Snapshot related Settings
                 BlobStoreRepository.SNAPSHOT_SHARD_PATH_PREFIX_SETTING,
@@ -868,7 +870,9 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 StreamTransportService.STREAM_TRANSPORT_REQ_TIMEOUT_SETTING,
                 StreamSearchTransportService.STREAM_SEARCH_ENABLED,
 
-                SearchService.CLUSTER_SEARCH_QUERY_PLAN_EXPLAIN_SETTING
+                SearchService.CLUSTER_SEARCH_QUERY_PLAN_EXPLAIN_SETTING,
+                SearchService.NATIVE_CLUSTER_CONCURRENT_SEGMENT_SEARCH_MODE,
+                SearchService.NATIVE_CONCURRENT_SEGMENT_SEARCH_TARGET_MAX_SLICE_COUNT_SETTING
             )
         )
     );

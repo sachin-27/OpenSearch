@@ -1,6 +1,8 @@
 package com.parquet.parquetdataformat.engine;
 
+import com.parquet.parquetdataformat.ParquetSettings;
 import com.parquet.parquetdataformat.bridge.RustBridge;
+import com.parquet.parquetdataformat.bridge.NativeSettings;
 import com.parquet.parquetdataformat.memory.ArrowBufferPool;
 import com.parquet.parquetdataformat.merge.CompactionStrategy;
 import com.parquet.parquetdataformat.merge.ParquetMergeExecutor;
@@ -11,7 +13,10 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.index.IndexSettings;
+import com.parquet.parquetdataformat.fields.ArrowFieldRegistry;
 import org.opensearch.index.engine.exec.DataFormat;
+import org.opensearch.index.engine.exec.EngineRole;
 import org.opensearch.index.engine.exec.IndexingExecutionEngine;
 import org.opensearch.index.engine.exec.Merger;
 import org.opensearch.index.engine.exec.RefreshInput;
@@ -69,13 +74,54 @@ public class ParquetExecutionEngine implements IndexingExecutionEngine<ParquetDa
 
     private final Supplier<Schema> schema;
     private final ShardPath shardPath;
-    private final ParquetMerger parquetMerger = new ParquetMergeExecutor(CompactionStrategy.RECORD_BATCH);
+    private final ParquetMerger parquetMerger;
     private final ArrowBufferPool arrowBufferPool;
+    private final IndexSettings indexSettings;
+    private final boolean isPrimaryEngine;
 
-    public ParquetExecutionEngine(Settings settings, Supplier<Schema> schema, ShardPath shardPath) {
+    public ParquetExecutionEngine(
+        Settings settings,
+        boolean isPrimaryEngine,
+        Supplier<Schema> schema,
+        ShardPath shardPath,
+        IndexSettings indexSettings
+    ) {
         this.schema = schema;
         this.shardPath = shardPath;
         this.arrowBufferPool = new ArrowBufferPool(settings);
+        this.indexSettings = indexSettings;
+        this.parquetMerger = new ParquetMergeExecutor(CompactionStrategy.RECORD_BATCH, indexSettings.getIndex().getName());
+        this.isPrimaryEngine = isPrimaryEngine;
+        // Push current settings to Rust store once on construction, then keep in sync on updates
+        pushSettingsToRust(indexSettings);
+
+        //When we make the settings as dynamic enable the below code
+//        indexSettings.getScopedSettings().addSettingsUpdateConsumer(
+//            ignored -> pushSettingsToRust(indexSettings),
+//            List.of(
+//                ParquetSettings.COMPRESSION_TYPE,
+//                ParquetSettings.COMPRESSION_LEVEL,
+//                ParquetSettings.PAGE_SIZE_BYTES,
+//                ParquetSettings.PAGE_ROW_LIMIT,
+//                ParquetSettings.DICT_SIZE_BYTES
+//            )
+//        );
+    }
+
+    private void pushSettingsToRust(IndexSettings indexSettings) {
+        NativeSettings config = new NativeSettings();
+        config.setIndexName(indexSettings.getIndex().getName());
+        config.setCompressionType(indexSettings.getValue(ParquetSettings.COMPRESSION_TYPE));
+        config.setCompressionLevel(indexSettings.getValue(ParquetSettings.COMPRESSION_LEVEL));
+        config.setPageSizeBytes(indexSettings.getValue(ParquetSettings.PAGE_SIZE_BYTES).getBytes());
+        config.setPageRowLimit(indexSettings.getValue(ParquetSettings.PAGE_ROW_LIMIT));
+        config.setDictSizeBytes(indexSettings.getValue(ParquetSettings.DICT_SIZE_BYTES).getBytes());
+        config.setRowGroupSizeBytes(indexSettings.getValue(ParquetSettings.ROW_GROUP_SIZE_BYTES).getBytes());
+        try {
+            RustBridge.onSettingsUpdate(config);
+        } catch (Exception e) {
+            logger.error("Failed to push Parquet settings to Rust store", e);
+        }
     }
 
     @Override
@@ -101,14 +147,15 @@ public class ParquetExecutionEngine implements IndexingExecutionEngine<ParquetDa
     }
 
     @Override
-    public List<String> supportedFieldTypes() {
-        return List.of();
+    public List<String> supportedFieldTypes(boolean isPrimaryEngine) {
+        return new java.util.ArrayList<>(ArrowFieldRegistry.getRegisteredFieldNames());
     }
 
     @Override
     public Writer<ParquetDocumentInput> createWriter(long writerGeneration) {
         String fileName = Path.of(shardPath.getDataPath().toString(), getDataFormat().name(), FILE_NAME_PREFIX + "_" + writerGeneration + FILE_NAME_EXT).toString();
-        return new ParquetWriter(fileName, schema.get(), writerGeneration, arrowBufferPool);
+        EngineRole role = isPrimaryEngine ? EngineRole.PRIMARY : EngineRole.SECONDARY;
+        return new ParquetWriter(fileName, schema.get(), writerGeneration, arrowBufferPool, indexSettings, role);
     }
 
     @Override
@@ -139,6 +186,11 @@ public class ParquetExecutionEngine implements IndexingExecutionEngine<ParquetDa
 
     @Override
     public void close() throws IOException {
+        try {
+            RustBridge.removeSettings(indexSettings.getIndex().getName());
+        } catch (Exception e) {
+            logger.warn("Failed to remove Parquet settings from Rust store for index [{}]", indexSettings.getIndex().getName(), e);
+        }
         arrowBufferPool.close();
     }
 }

@@ -21,7 +21,7 @@ public interface Writer<P extends DocumentInput<?>> {
 
     void sync() throws IOException;
 
-    void close();
+    void close() throws IOException;
 
     P newDocumentInput();
 

@@ -8,6 +8,9 @@
 
 package org.opensearch.index.engine.exec.merge;
 
+import org.apache.lucene.index.NoMergePolicy;
+import org.opensearch.index.engine.exec.coord.Segment;
+
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.opensearch.common.logging.Loggers;
@@ -40,8 +43,13 @@ public class CompositeMergeHandler extends MergeHandler {
         this.logger = Loggers.getLogger(getClass(), shardId);
         this.compositeEngine = compositeEngine;
         this.compositeIndexingExecutionEngine = compositeIndexingExecutionEngine;
-
-        mergePolicy = new CompositeMergePolicy(indexSettings.getMergePolicy(true), shardId);
+        List<String> secondaryDataFormatNames = indexSettings.getValue(IndexSettings.INDEX_COMPOSITE_SECONDARY_DATA_FORMATS_SETTING);
+        if(secondaryDataFormatNames.isEmpty()) {
+            mergePolicy = new CompositeMergePolicy(indexSettings.getMergePolicy(true), shardId);
+        } else {
+            // TODO:: Remove this once the Merge is working for multi format setup
+            mergePolicy = new CompositeMergePolicy(NoMergePolicy.INSTANCE, shardId);
+        }
     }
 
     @Override
@@ -50,12 +58,12 @@ public class CompositeMergeHandler extends MergeHandler {
         try (CompositeEngine.ReleasableRef<CatalogSnapshot> catalogSnapshotReleasableRef = compositeEngine.acquireSnapshot()) {
             CatalogSnapshot catalogSnapshot = catalogSnapshotReleasableRef.getRef();
 
-            List<CatalogSnapshot.Segment> segmentList = catalogSnapshot.getSegments();
-            List<List<CatalogSnapshot.Segment>> mergeCandidates =
+            List<Segment> segmentList = catalogSnapshot.getSegments();
+            List<List<Segment>> mergeCandidates =
                 mergePolicy.findForceMergeCandidates(segmentList, maxSegmentCount);
 
             // Process merge candidates
-            for (List<CatalogSnapshot.Segment> mergeGroup : mergeCandidates) {
+            for (List<Segment> mergeGroup : mergeCandidates) {
                 oneMerges.add(new OneMerge(mergeGroup));
             }
         } catch (Exception e) {
@@ -71,12 +79,12 @@ public class CompositeMergeHandler extends MergeHandler {
         try (CompositeEngine.ReleasableRef<CatalogSnapshot> catalogSnapshotReleasableRef = compositeEngine.acquireSnapshot()) {
             CatalogSnapshot catalogSnapshot = catalogSnapshotReleasableRef.getRef();
 
-            List<CatalogSnapshot.Segment> segmentList = catalogSnapshot.getSegments();
-            List<List<CatalogSnapshot.Segment>> mergeCandidates =
+            List<Segment> segmentList = catalogSnapshot.getSegments();
+            List<List<Segment>> mergeCandidates =
                 mergePolicy.findMergeCandidates(segmentList);
 
             // Process merge candidates
-            for (List<CatalogSnapshot.Segment> mergeGroup : mergeCandidates) {
+            for (List<Segment> mergeGroup : mergeCandidates) {
                 oneMerges.add(new OneMerge(mergeGroup));
             }
         } catch (Exception e) {

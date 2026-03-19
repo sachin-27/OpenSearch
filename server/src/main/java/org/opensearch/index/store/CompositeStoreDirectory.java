@@ -11,10 +11,11 @@ package org.opensearch.index.store;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.*;
 import org.opensearch.common.annotation.PublicApi;
+import org.opensearch.common.logging.Loggers;
 import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.IndexSettings;
 import org.opensearch.index.engine.exec.FileMetadata;
-import org.opensearch.index.engine.exec.coord.Any;
 import org.opensearch.index.shard.ShardPath;
 import org.opensearch.plugins.DataSourcePlugin;
 import org.opensearch.plugins.PluginsService;
@@ -32,6 +33,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import static org.opensearch.index.shard.ShardPath.INDEX_FOLDER_NAME;
+import static org.opensearch.index.shard.ShardPath.METADATA_FOLDER_NAME;
+
 /**
  * Composite directory that coordinates multiple format-specific directories.
  * Routes file operations to appropriate format directories based on file type.
@@ -42,32 +46,38 @@ import java.util.stream.Collectors;
  * @opensearch.api
  */
 @PublicApi(since = "3.0.0")
-public class CompositeStoreDirectory extends Directory {
+public class CompositeStoreDirectory extends Store.StoreDirectory {
 
-    private Any dataFormat;
-    private final Path directoryPath;
     public final List<FormatStoreDirectory<?>> delegates = new ArrayList<>();
     public final HashMap<String, FormatStoreDirectory<?>> delegatesMap  = new HashMap<>();
 
     private final Logger logger;
     private final DirectoryFileTransferTracker directoryFileTransferTracker;
-    private final ShardPath shardPath;
 
     /**
      * Simplified constructor for auto-discovery (like CompositeIndexingExecutionEngine)
      */
-    public CompositeStoreDirectory(IndexSettings indexSettings, PluginsService pluginsService, ShardPath shardPath, Logger logger) {
-        this.shardPath = shardPath;
+    public CompositeStoreDirectory(IndexSettings indexSettings, PluginsService pluginsService, ShardId shardId, ShardPath shardPath, Logger logger) {
+        super(null, Loggers.getLogger("index.store.deletes", shardId));
         this.logger = logger;
         this.directoryFileTransferTracker = new DirectoryFileTransferTracker();
-        this.directoryPath = shardPath.getDataPath();
 
         try {
+            FormatStoreDirectory<?> metadataDirectory = createMetadataDirectory(shardPath);
+            delegatesMap.put("metadata", metadataDirectory);
+            // Also register under "Lucene" since LuceneDataFormat.name() returns "Lucene"
+            // and callers look up by that key (e.g. IndexShard.extractFormatAwareMetadata)
+            delegatesMap.put("Lucene", metadataDirectory);
+
             pluginsService.filterPlugins(DataSourcePlugin.class).forEach(plugin -> {
                 try {
                     FormatStoreDirectory<?> formatDir = plugin.createFormatStoreDirectory(indexSettings, shardPath);
-                    delegates.add(formatDir);
-                    delegatesMap.put(plugin.getDataFormat().name(), formatDir);
+                    if (formatDir != null) {
+                        delegates.add(formatDir);
+                        delegatesMap.put(plugin.getDataFormat().name(), formatDir);
+                    } else {
+                        logger.debug("DataSourcePlugin {} returned null FormatStoreDirectory, skipping", plugin.getDataFormat().name());
+                    }
                 } catch (IOException e) {
                     logger.error("Failed to create FormatStoreDirectory for format: {}", plugin.getDataFormat().name(), e);
                     throw new RuntimeException("Failed to create format directory for " + plugin.getDataFormat().name(), e);
@@ -82,8 +92,18 @@ public class CompositeStoreDirectory extends Directory {
         }
     }
 
+    /**
+     * Creates a metadata directory that points to the base Lucene directory where segments_N files are stored.
+     * This directory is at {@code <dataPath>/lucene/} and always exists regardless of active data formats.
+     */
+    private FormatStoreDirectory<?> createMetadataDirectory(ShardPath shardPath) throws IOException {
+        // Create FSDirectory pointing to <dataPath>/lucene/ where segments_N files live
+        Path luceneIndexPath = shardPath.resolveIndex(); // Returns <dataPath>/lucene/
+        Directory luceneDirectory = FSDirectory.open(luceneIndexPath);
+        return new LuceneStoreDirectory(luceneIndexPath, luceneDirectory);
+    }
+
     public void initialize() throws IOException {
-        // Initialize all delegates
         for (FormatStoreDirectory<?> delegate : delegates) {
             delegate.initialize();
         }
@@ -109,11 +129,6 @@ public class CompositeStoreDirectory extends Directory {
         FormatStoreDirectory<?> directory = delegatesMap.get(dataFormatName);
 
         if (directory == null) {
-
-            if(dataFormatName.equalsIgnoreCase("TempMetadata") && !delegates.isEmpty())
-            {
-                return delegates.getFirst();
-            }
             List<String> availableFormats = new ArrayList<>(delegatesMap.keySet());
 
             logger.error("Format routing failed: requested format '{}' not found. Available formats: {}. " +
@@ -294,6 +309,25 @@ public class CompositeStoreDirectory extends Directory {
     @Override
     public void rename(String source, String dest) throws IOException {
         throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Renames a file within the appropriate format directory.
+     * This method is format-aware and routes the rename operation to the correct directory
+     * based on the dataFormat in the FileMetadata.
+     *
+     * @param source The source file metadata (must contain dataFormat)
+     * @param dest The destination file metadata (must have same dataFormat as source)
+     * @throws IOException if rename fails or formats don't match
+     */
+    public void rename(FileMetadata source, FileMetadata dest) throws IOException {
+        if (!source.dataFormat().equals(dest.dataFormat())) {
+            throw new IllegalArgumentException("Cannot rename across formats: "
+                + source.dataFormat() + " -> " + dest.dataFormat());
+        }
+
+        FormatStoreDirectory<?> formatDir = getDirectoryForFormat(source.dataFormat());
+        formatDir.rename(source.file(), dest.file());
     }
 
     @Override

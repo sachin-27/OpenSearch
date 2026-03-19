@@ -84,7 +84,7 @@ public class DatafusionSearcher implements EngineSearcher<DatafusionQuery, Recor
         
         // Default: use direct S3 Tables access
         CompletableFuture<Long> result = new CompletableFuture<>();
-        NativeBridge.executeQueryPhaseAsync(reader.getReaderPtr(), datafusionQuery.getIndexName(), datafusionQuery.getSubstraitBytes(), datafusionQuery.getQueryPlanExplainEnabled(), runtimePtr, new ActionListener<Long>() {
+        NativeBridge.executeQueryPhaseAsync(reader.getReaderPtr(), datafusionQuery.getIndexName(), datafusionQuery.getSubstraitBytes(), datafusionQuery.getQueryPlanExplainEnabled(), datafusionQuery.getTargetPartitionsCount(), runtimePtr, new ActionListener<Long>() {
             @Override
             public void onResponse(Long streamPointer) {
                 logger.info("[FLOW] Query phase async response: streamPointer={}", streamPointer);

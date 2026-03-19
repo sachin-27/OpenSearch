@@ -9,65 +9,109 @@
 package org.opensearch.index.engine.exec.commit;
 
 import org.apache.logging.log4j.Logger;
+import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexCommit;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.NoMergePolicy;
+import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentInfos;
+import org.apache.lucene.misc.store.HardlinkCopyDirectoryWrapper;
 import org.apache.lucene.store.NIOFSDirectory;
 import org.opensearch.common.collect.MapBuilder;
 import org.opensearch.common.concurrent.GatedCloseable;
 import org.opensearch.common.logging.Loggers;
+import org.opensearch.common.lucene.Lucene;
+import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.engine.CombinedDeletionPolicy;
 import org.opensearch.index.engine.CommitStats;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.SafeCommitInfo;
+import org.opensearch.index.engine.SoftDeletesPolicy;
 import org.opensearch.index.engine.exec.DataFormat;
 import org.opensearch.index.engine.exec.WriterFileSet;
 import org.opensearch.index.engine.exec.coord.CatalogSnapshot;
+import org.opensearch.index.engine.exec.coord.Segment;
+import org.opensearch.index.engine.exec.lucene.LuceneDataFormat;
 import org.opensearch.index.store.Store;
 import org.opensearch.index.translog.TranslogDeletionPolicy;
 
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Base64;
-import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
+import java.util.stream.Collectors;
 
 public class LuceneCommitEngine implements Committer {
 
     private final Logger logger;
-    private final IndexWriter indexWriter;
+    private IndexWriter indexWriter;
     private final CombinedDeletionPolicy combinedDeletionPolicy;
     private final Store store;
     private volatile SegmentInfos lastCommittedSegmentInfos;
 
-    public LuceneCommitEngine(Store store, TranslogDeletionPolicy translogDeletionPolicy, LongSupplier globalCheckpointSupplier)
+    public LuceneCommitEngine(Store store, TranslogDeletionPolicy translogDeletionPolicy, LongSupplier globalCheckpointSupplier, boolean primaryMode)
         throws IOException {
         this.logger = Loggers.getLogger(LuceneCommitEngine.class, store.shardId());
         this.combinedDeletionPolicy = new CombinedDeletionPolicy(logger, translogDeletionPolicy, null, globalCheckpointSupplier);
         IndexWriterConfig indexWriterConfig = new IndexWriterConfig();
         indexWriterConfig.setIndexDeletionPolicy(combinedDeletionPolicy);
+        indexWriterConfig.setMergePolicy(NoMergePolicy.INSTANCE);
         this.store = store;
         this.lastCommittedSegmentInfos = store.readLastCommittedSegmentsInfo();
-        this.indexWriter = new IndexWriter(store.directory(), indexWriterConfig);
+        if (primaryMode) {
+            this.indexWriter = new IndexWriter(store.directory(), indexWriterConfig);
+        }
     }
 
     @Override
-    public void addLuceneIndexes(CatalogSnapshot catalogSnapshot) {
-        Collection<WriterFileSet> luceneFileCollection = catalogSnapshot.getSearchableFiles(DataFormat.LUCENE.name());
-        luceneFileCollection.forEach(writerFileSet -> {
+    public synchronized void addLuceneIndexes(List<Segment> segments) throws IOException {
+
+        for(Segment segment : segments) {
+            WriterFileSet wfs = segment.getDFGroupedSearchableFiles().get(LuceneDataFormat.LUCENE.name());
+            if(wfs == null || wfs.refresh()) continue;
+
             try {
-                indexWriter.addIndexes(new NIOFSDirectory(Path.of(writerFileSet.getDirectory())));
+                indexWriter.addIndexes(new HardlinkCopyDirectoryWrapper(new NIOFSDirectory(Path.of(wfs.getDirectory()))));
+                wfs.setRefreshed();
             } catch (IOException e) {
-                throw new RuntimeException(e);
+                throw new RuntimeException("Not able to copy it to the main writer in commiter: {}", e);
             }
-        });
+        }
+
+        final Map<Long, Segment> segmentByGeneration =
+            segments.stream().collect(Collectors.toMap(Segment::getGeneration, Function.identity()));
+
+        try (DirectoryReader dr = DirectoryReader.open(indexWriter)){
+            for(LeafReaderContext leaf : dr.getContext().leaves()) {
+                SegmentCommitInfo segmentCommitInfo = Lucene.segmentReader(leaf.reader()).getSegmentInfo();
+                String generationAttr = segmentCommitInfo.info.getAttribute("writer_generation");
+                if(generationAttr == null) {
+                    throw new RuntimeException("failed to fetch writer generation");
+                }
+                long writerGeneration = Long.parseLong(generationAttr);
+                if (segmentByGeneration.containsKey(writerGeneration)) {
+                    WriterFileSet writerFileSet =
+                        segmentByGeneration.get(writerGeneration).getDFGroupedSearchableFiles().get(DataFormat.LUCENE.name());
+                    Path oldDirectoryPath = Path.of(writerFileSet.getDirectory());
+                    segmentByGeneration.get(writerGeneration).addSearchableFiles(
+                        DataFormat.LUCENE.name(),
+                        writerFileSet.withDirectoryAndFiles(indexWriter.getDirectory().toString(), new HashSet<>(segmentCommitInfo.files()))
+                    );
+                    // Deletes the older path once the file path has been updated
+                    IOUtils.rm(oldDirectoryPath);
+                }
+            }
+        }
     }
 
     @Override
     public synchronized CommitPoint commit(Iterable<Map.Entry<String, String>> commitData, CatalogSnapshot catalogSnapshot) {
-        addLuceneIndexes(catalogSnapshot);
         indexWriter.setLiveCommitData(commitData);
         try {
             indexWriter.commit();
@@ -114,6 +158,15 @@ public class LuceneCommitEngine implements Committer {
     }
 
     /**
+     * Sets the soft deletes policy on the underlying CombinedDeletionPolicy.
+     * This enables proper checkpoint tracking for peer recovery and translog trimming.
+     * Must be called after the SoftDeletesPolicy is created.
+     */
+    public void setSoftDeletesPolicy(SoftDeletesPolicy softDeletesPolicy) {
+        this.combinedDeletionPolicy.setSoftDeletesPolicy(softDeletesPolicy);
+    }
+
+    /**
      * Acquires the most recent safe index commit snapshot.
      * All index files referenced by this commit won't be freed until the commit/snapshot is closed.
      * This method is required for replica recovery operations.
@@ -136,6 +189,6 @@ public class LuceneCommitEngine implements Committer {
 
     @Override
     public void close() throws IOException {
-        this.indexWriter.close();
+        IOUtils.close(indexWriter);
     }
 }

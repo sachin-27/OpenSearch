@@ -15,11 +15,10 @@ import org.apache.lucene.index.IndexFileNames;
 import org.apache.lucene.index.SegmentCommitInfo;
 import org.apache.lucene.index.SegmentInfo;
 import org.apache.lucene.index.SegmentInfos;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.*;
+import org.apache.lucene.util.Version;
 import org.opensearch.common.Nullable;
+import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.annotation.InternalApi;
 import org.opensearch.common.annotation.PublicApi;
@@ -29,6 +28,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.engine.exec.FileMetadata;
 import org.opensearch.index.engine.exec.coord.CatalogSnapshot;
+import org.opensearch.index.engine.exec.coord.CompositeEngineCatalogSnapshot;
 import org.opensearch.index.remote.RemoteStoreUtils;
 import org.opensearch.index.store.lockmanager.FileLockInfo;
 import org.opensearch.index.store.lockmanager.RemoteStoreLockManager;
@@ -44,14 +44,8 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.NoSuchFileException;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.nio.file.Path;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
@@ -65,12 +59,6 @@ import java.util.stream.Collectors;
  */
 @PublicApi(since = "2.3.0")
 public final class CompositeRemoteSegmentStoreDirectory extends RemoteSegmentStoreDirectory {
-
-    /**
-     * Each segment file is uploaded with unique suffix.
-     * For example, _0.cfe in local filesystem will be uploaded to remote segment store as _0.cfe__gX7bNIIBrs0AUNsR2yEG
-     */
-    public static final String SEGMENT_NAME_UUID_SEPARATOR = "__";
 
     /**
      * compositeRemoteDirectory is used to store segment files with format-specific routing
@@ -157,7 +145,7 @@ public final class CompositeRemoteSegmentStoreDirectory extends RemoteSegmentSto
         ShardId shardId,
         @Nullable Map<FileMetadata, String> pendingDownloadMergedSegments
     ) throws IOException {
-        super(null, remoteMetadataDirectory, mdLockManager, threadPool, shardId);
+        super(compositeRemoteDirectory, remoteMetadataDirectory, mdLockManager, threadPool, shardId);
         this.compositeRemoteDirectory = compositeRemoteDirectory;
         this.remoteMetadataDirectory = remoteMetadataDirectory;
         this.mdLockManager = mdLockManager;
@@ -186,27 +174,6 @@ public final class CompositeRemoteSegmentStoreDirectory extends RemoteSegmentSto
         }
         logger.debug("Initialisation of remote segment metadata completed");
         return remoteSegmentMetadata;
-    }
-
-    /**
-     * Read the latest metadata file to get the list of segments uploaded to the remote segment store.
-     * Delegates to CompositeRemoteDirectory when available for better format-aware metadata handling.
-     */
-    public RemoteSegmentMetadata readLatestMetadataFile() throws IOException {
-        if (compositeRemoteDirectory != null) {
-            logger.debug("Reading latest metadata file from CompositeRemoteDirectory for better format-aware handling");
-            return compositeRemoteDirectory.readLatestMetadataFile();
-        } else {
-            logger.info("No CompositeRemoteDirectory found");
-            return null;
-        }
-    }
-
-    private RemoteSegmentMetadata readMetadataFile(String metadataFilename) throws IOException {
-        try (InputStream inputStream = remoteMetadataDirectory.getBlobStream(metadataFilename)) {
-            byte[] metadataBytes = inputStream.readAllBytes();
-            return metadataStreamWrapper.readStream(new ByteArrayIndexInput(metadataFilename, metadataBytes));
-        }
     }
 
     /**
@@ -475,8 +442,7 @@ public final class CompositeRemoteSegmentStoreDirectory extends RemoteSegmentSto
     }
 
     public boolean containsFile(String localFilename, String checksum) {
-        return segmentsUploadedToRemoteStore.containsKey(localFilename)
-            && segmentsUploadedToRemoteStore.get(localFilename).getChecksum().equals(checksum);
+        return containsFile(new FileMetadata(localFilename), checksum);
     }
 
     public boolean containsFile(FileMetadata fileMetadata, String checksum) {
@@ -493,8 +459,14 @@ public final class CompositeRemoteSegmentStoreDirectory extends RemoteSegmentSto
         return null;
     }
 
-    private String getNewRemoteSegmentFilename(String localFilename) {
-        return localFilename + SEGMENT_NAME_UUID_SEPARATOR + UUIDs.base64UUID();
+    @Override
+    protected String getNewRemoteSegmentFilename(String localFilename) {
+        String[] fileNameAndExtension = extractFileExtension(localFilename);
+        return fileNameAndExtension[0] + SEGMENT_NAME_UUID_SEPARATOR + UUIDs.base64UUID() + "." + fileNameAndExtension[1];
+    }
+
+    private static String[] extractFileExtension(String localFilename) {
+        return localFilename.split("\\.");
     }
 
     public Map<String, UploadedSegmentMetadata> getSegmentsUploadedToRemoteStore() {
@@ -533,9 +505,10 @@ public final class CompositeRemoteSegmentStoreDirectory extends RemoteSegmentSto
                 translogGeneration, metadataUploadCounter.incrementAndGet(),
                 RemoteSegmentMetadata.CURRENT_VERSION, nodeId);
 
-            FileMetadata fileMetadata = new FileMetadata("TempMetadata", metadataFilename);
-            Map<FileMetadata, String> uploadedSegments = new HashMap<>();
+            // Use "metadata" format instead of "TempMetadata" - temp metadata files use the same directory as metadata files
+            FileMetadata fileMetadata = new FileMetadata("metadata", metadataFilename);
 
+            Map<FileMetadata, String> uploadedSegments = new HashMap<>();
             try {
                 try (IndexOutput indexOutput = storeDirectory.createOutput(fileMetadata, IOContext.DEFAULT)) {
                     // TODO: Implement getSegmentToLuceneVersion for CatalogSnapshot when needed
@@ -557,21 +530,24 @@ public final class CompositeRemoteSegmentStoreDirectory extends RemoteSegmentSto
                         }
                     }
 
-                    // Serialize CatalogSnapshot using StreamOutput
-                    byte[] catalogSnapshotByteArray;
-                    try (org.opensearch.common.io.stream.BytesStreamOutput streamOutput =
-                             new org.opensearch.common.io.stream.BytesStreamOutput()) {
-                        catalogSnapshot.writeTo(streamOutput);
-                        catalogSnapshotByteArray = streamOutput.bytes().toBytesRef().bytes;
-                    }
+                    SegmentInfos segmentInfosSnapshot = new SegmentInfos(Version.LATEST.major);
+                    Map<String, String> userData = catalogSnapshot.getUserData();
+                    userData.put(CompositeEngineCatalogSnapshot.CATALOG_SNAPSHOT_KEY, catalogSnapshot.serializeToString());
+                    segmentInfosSnapshot.setUserData(userData, false);
+                    segmentInfosSnapshot.setNextWriteGeneration(replicationCheckpoint.getSegmentsGen());
+                    ByteBuffersDataOutput byteBuffersIndexOutput = new ByteBuffersDataOutput();
+                    segmentInfosSnapshot.write(
+                        new ByteBuffersIndexOutput(byteBuffersIndexOutput, "Snapshot of SegmentInfos", "SegmentInfos")
+                    );
+                    byte[] segmentInfoSnapshotByteArray = byteBuffersIndexOutput.toArrayCopy();
 
                     metadataStreamWrapper.writeStream(indexOutput, new RemoteSegmentMetadata(
                         RemoteSegmentMetadata.fromMapOfStringsV2(uploadedSegments),
-                        catalogSnapshotByteArray, replicationCheckpoint));
+                        segmentInfoSnapshotByteArray, replicationCheckpoint));
                 }
 
                 storeDirectory.sync(Collections.singleton(fileMetadata.serialize()));
-                compositeRemoteDirectory.copyFrom(storeDirectory, fileMetadata, metadataFilename, IOContext.DEFAULT);
+                remoteMetadataDirectory.copyFrom(storeDirectory, metadataFilename, metadataFilename, IOContext.DEFAULT);
             } finally {
                 tryAndDeleteLocalFile(fileMetadata, storeDirectory);
             }
@@ -581,28 +557,13 @@ public final class CompositeRemoteSegmentStoreDirectory extends RemoteSegmentSto
         }
     }
 
+    public void deleteStaleSegmentsAsync(int lastNMetadataFilesToKeep) {
+        deleteStaleSegmentsAsync(lastNMetadataFilesToKeep, ActionListener.wrap(r -> {}, e -> {}));
+    }
+
     @Override
-    public Set<String> deleteStaleSegments(int lastNMetadataFilesToKeep) throws IOException {
-        if (lastNMetadataFilesToKeep == -1) {
-            logger.info("Stale segment deletion is disabled if cluster.remote_store.index.segment_metadata.retention.max_count is set to -1");
-            return Collections.emptySet();
-        }
-
-        List<String> sortedMetadataFileList = remoteMetadataDirectory.listFilesByPrefixInLexicographicOrder(
-            MetadataFilenameUtils.METADATA_PREFIX, Integer.MAX_VALUE);
-
-        if (sortedMetadataFileList.size() <= lastNMetadataFilesToKeep) {
-            logger.debug("Number of commits in remote segment store={}, lastNMetadataFilesToKeep={}",
-                sortedMetadataFileList.size(), lastNMetadataFilesToKeep);
-            return Collections.emptySet();
-        }
-
-        // Implementation continues... (keeping existing logic but using compositeRemoteDirectory directly)
-        Set<String> deletedSegmentFiles = new HashSet<>();
-        // ... stale segment deletion logic using compositeRemoteDirectory.deleteFile() directly
-
-        logger.debug("deletedSegmentFiles={}", deletedSegmentFiles);
-        return deletedSegmentFiles;
+    protected void removeFileFromSegmentsUploadedToRemoteStore(UploadedSegmentMetadata segmentMetadata) {
+        segmentsUploadedToRemoteStore.remove(new FileMetadata(segmentMetadata.getDataFormat(), segmentMetadata.getOriginalFilename()));
     }
 
     @Override
@@ -641,7 +602,7 @@ public final class CompositeRemoteSegmentStoreDirectory extends RemoteSegmentSto
     }
 
     public void close() throws IOException {
-        deleteStaleSegmentsAsync(0, ActionListener.wrap(r -> {
+        deleteStaleSegmentsAsync(0, ActionListener.<Set<String>>wrap(r -> {
             try { deleteIfEmpty(); } catch (IOException ex) {
                 logger.error("Failed to delete empty directory on close", ex);
             }

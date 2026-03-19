@@ -165,13 +165,13 @@ import org.opensearch.index.autoforcemerge.AutoForceMergeMetrics;
 import org.opensearch.index.compositeindex.CompositeIndexSettings;
 import org.opensearch.index.engine.EngineFactory;
 import org.opensearch.index.engine.MergedSegmentWarmerFactory;
+import org.opensearch.index.engine.exec.lucene.LuceneDataSourcePlugin;
 import org.opensearch.index.mapper.MappingTransformerRegistry;
 import org.opensearch.index.recovery.RemoteStoreRestoreService;
 import org.opensearch.index.remote.RemoteIndexPathUploader;
 import org.opensearch.index.remote.RemoteStoreStatsTrackerFactory;
 import org.opensearch.index.store.DefaultCompositeDirectoryFactory;
 import org.opensearch.index.store.IndexStoreListener;
-import org.opensearch.index.store.CompositeRemoteSegmentStoreDirectoryFactory;
 import org.opensearch.index.store.RemoteSegmentStoreDirectoryFactory;
 import org.opensearch.index.store.remote.filecache.FileCache;
 import org.opensearch.index.store.remote.filecache.FileCacheCleaner;
@@ -552,6 +552,22 @@ public class Node implements Closeable {
 
             // Ensure feature flags from opensearch.yml are valid during plugin initialization.
             FeatureFlags.initializeFeatureFlags(tmpSettings);
+
+            PluginInfo lucenePluginInfo = new PluginInfo(
+                "LuceneDataformatPlugin",
+                "Lucene composite dataformat plugin",
+                "1.0",
+                Version.CURRENT,
+                "1.8",
+                LuceneDataSourcePlugin.class.getName(),
+                null,
+                Collections.emptyList(),
+                false
+            );
+
+            List<PluginInfo> allClasspathPlugins = new ArrayList<>(classpathPlugins);
+            allClasspathPlugins.add(lucenePluginInfo);
+            classpathPlugins = allClasspathPlugins;
 
             this.pluginsService = new PluginsService(
                 tmpSettings,
@@ -970,7 +986,7 @@ public class Node implements Closeable {
 
             final CompositeIndexSettings compositeIndexSettings = new CompositeIndexSettings(settings, settingsModule.getClusterSettings());
 
-            final IndexStorePlugin.DirectoryFactory remoteDirectoryFactory = new CompositeRemoteSegmentStoreDirectoryFactory(
+            final IndexStorePlugin.DirectoryFactory remoteDirectoryFactory = new RemoteSegmentStoreDirectoryFactory(
                 repositoriesServiceReference::get,
                 threadPool,
                 remoteStoreSettings.getSegmentsPathFixedPrefix(),

@@ -25,6 +25,9 @@ import org.opensearch.common.blobstore.exception.CorruptFileException;
 import org.opensearch.common.blobstore.stream.write.WriteContext;
 import org.opensearch.common.blobstore.stream.write.WritePriority;
 import org.opensearch.common.blobstore.transfer.RemoteTransferContainer;
+import org.opensearch.index.store.exception.ChecksumCombinationException;
+
+import static org.opensearch.common.blobstore.transfer.RemoteTransferContainer.checksumOfChecksum;
 import org.opensearch.common.blobstore.transfer.stream.OffsetRangeIndexInputStream;
 import org.opensearch.common.blobstore.transfer.stream.OffsetRangeInputStream;
 import org.opensearch.common.lucene.store.ByteArrayIndexInput;
@@ -34,9 +37,7 @@ import org.opensearch.index.engine.MergedSegmentWarmer;
 import org.opensearch.index.engine.exec.DataFormat;
 import org.opensearch.index.engine.exec.FileMetadata;
 import org.opensearch.index.engine.exec.coord.Any;
-import org.opensearch.index.store.CompositeStoreDirectory;
-import org.opensearch.index.store.RemoteIndexInput;
-import org.opensearch.index.store.RemoteIndexOutput;
+import org.opensearch.index.store.*;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadata;
 import org.opensearch.index.store.remote.metadata.RemoteSegmentMetadataHandlerFactory;
 import org.opensearch.common.io.VersionedCodecStreamWrapper;
@@ -47,11 +48,14 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.NoSuchFileException;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.UnaryOperator;
+import java.util.stream.Collectors;
+
 
 /**
  * CompositeRemoteDirectory with direct BlobContainer access per format.
@@ -65,7 +69,7 @@ import java.util.function.UnaryOperator;
  * @opensearch.api
  */
 @PublicApi(since = "3.0.0")
-public class CompositeRemoteDirectory implements Closeable {
+public class CompositeRemoteDirectory extends RemoteDirectory {
 
     /**
      * Metadata stream wrapper for reading/writing RemoteSegmentMetadata
@@ -87,8 +91,9 @@ public class CompositeRemoteDirectory implements Closeable {
      */
     final Map<FileMetadata, String> pendingDownloadMergedSegments;
 
+    private static final int SEGMENT_CHECKSUM_BYTES = 8;
+
     private final Map<String, BlobContainer> formatBlobContainers;
-    private  final BlobContainer metadataBlobContainer;
     private final BlobStore blobStore;
     private final BlobPath baseBlobPath;
     private final Logger logger;
@@ -107,6 +112,19 @@ public class CompositeRemoteDirectory implements Closeable {
         Logger logger,
         PluginsService pluginsService
     ) {
+        super(
+            blobStore.blobContainer(baseBlobPath),
+            uploadRateLimiter,
+            lowPriorityUploadRateLimiter,
+            downloadRateLimiter,
+            lowPriorityDownloadRateLimiter,
+            pendingDownloadMergedSegments.entrySet().stream().collect(
+                Collectors.toMap(
+                    e -> e.getKey().serialize(),
+                    Map.Entry::getValue
+                )
+            )
+        );
         this.formatBlobContainers = new ConcurrentHashMap<>();
         this.blobStore = blobStore;
         this.baseBlobPath = baseBlobPath;
@@ -116,22 +134,31 @@ public class CompositeRemoteDirectory implements Closeable {
         this.pendingDownloadMergedSegments = pendingDownloadMergedSegments;
         this.logger = logger;
 
-        BlobPath metadataBlobPath = Objects.requireNonNull(baseBlobPath.parent()).add("metadata");
-        this.metadataBlobContainer = blobStore.blobContainer(metadataBlobPath);
-
-        try {
-            pluginsService.filterPlugins(DataSourcePlugin.class).forEach(
-                plugin -> {
-                    try {
-                        formatBlobContainers.put(plugin.getDataFormat().name(), plugin.createBlobContainer(blobStore, baseBlobPath));
-                    } catch (IOException e) {
-                        logger.error("failed to create blob container for dataformat {} at base path {}", plugin.getDataFormat().name(), baseBlobPath, e);
-                        throw new RuntimeException(e);
+        pluginsService.filterPlugins(DataSourcePlugin.class).forEach(
+            plugin -> {
+                try {
+                    BlobContainer container = plugin.createBlobContainer(blobStore, baseBlobPath);
+                    if (container != null) {
+                        formatBlobContainers.put(plugin.getDataFormat().name(), container);
+                    } else {
+                        logger.warn("DataSourcePlugin {} returned null BlobContainer, skipping", plugin.getDataFormat().name());
                     }
+                } catch (IOException e) {
+                    logger.error("failed to create blob container for dataformat {} at base path {}", plugin.getDataFormat().name(), baseBlobPath, e);
+                    throw new RuntimeException(e);
                 }
-            );
-        } catch (NullPointerException e) {
-            formatBlobContainers.put("", null);
+            }
+        );
+
+        // Register the Lucene format container at baseBlobPath (not a subdirectory).
+        // Lucene segment files (_0.cfs, _0.cfe, _0.si, etc.) are stored directly at baseBlobPath
+        // by the original RemoteDirectory. Using baseBlobPath ensures compatibility for both
+        // upload (writing new files) and download (reading existing files during replication).
+        // LuceneDataSourcePlugin intentionally returns null from createBlobContainer() because it
+        // delegates to this fallback registration.
+        if (!formatBlobContainers.containsKey("Lucene")) {
+            formatBlobContainers.put("Lucene", blobStore.blobContainer(baseBlobPath));
+            logger.debug("Registered Lucene BlobContainer at base path: {}", baseBlobPath);
         }
 
         logger.debug("Created CompositeRemoteDirectory with {} format BlobContainers",
@@ -215,13 +242,17 @@ public class CompositeRemoteDirectory implements Closeable {
     ) throws Exception {
         assert ioContext != IOContext.READONCE : "Remote upload will fail with IoContext.READONCE";
         String dataFormat = src.dataFormat();
-        long expectedChecksum = calculateChecksumOfChecksum(from, src);
+        Long expectedChecksum = calculateChecksumOfChecksum(from, src);
         long contentLength;
         IndexInput indexInput = from.openInput(src, ioContext);
         try {
             contentLength = indexInput.length();
+            // Remote integrity checking (S3 CRC32 validation) requires a Lucene codec footer
+            // to compute checksumOfChecksum. Non-Lucene formats (e.g. parquet) have their own
+            // file formats without Lucene codec footers, so integrity checking must be disabled
+            // for them to avoid S3 rejecting the upload with a CRC32 mismatch.
             boolean remoteIntegrityEnabled = false;
-            if (getBlobContainer(dataFormat) instanceof AsyncMultiStreamBlobContainer) {
+            if ("Lucene".equals(dataFormat) && getBlobContainer(dataFormat) instanceof AsyncMultiStreamBlobContainer) {
                 remoteIntegrityEnabled = ((AsyncMultiStreamBlobContainer) getBlobContainer(dataFormat)).remoteIntegrityCheckSupported();
             }
             lowPriorityUpload = lowPriorityUpload || contentLength > ByteSizeUnit.GB.toBytes(15);
@@ -300,8 +331,34 @@ public class CompositeRemoteDirectory implements Closeable {
         return formatBlobContainers.get(df);
     }
 
-    private long calculateChecksumOfChecksum(CompositeStoreDirectory from, FileMetadata fileMetadata) throws IOException {
-        return from.calculateChecksum(fileMetadata);
+    private Long calculateChecksumOfChecksum(CompositeStoreDirectory from, FileMetadata fileMetadata) throws IOException {
+        // checksumOfChecksum requires a Lucene codec footer which only Lucene-format files have.
+        // Non-Lucene formats (e.g. parquet) use their own file formats without Lucene codec footers.
+        // Returning null skips both remote (S3 CRC32 header) and local (post-upload) integrity checks,
+        // which is the correct behavior since RemoteTransferContainer only checks when expectedChecksum != null.
+        if (!"Lucene".equals(fileMetadata.dataFormat())) {
+            return null;
+        }
+        try (IndexInput indexInput = from.openInput(fileMetadata, IOContext.READONCE)) {
+            try {
+                return checksumOfChecksum(indexInput, SEGMENT_CHECKSUM_BYTES);
+            } catch (Exception e) {
+                throw new ChecksumCombinationException(
+                    "Potentially corrupted file: Checksum combination failed while combining stored checksum "
+                        + "and calculated checksum of stored checksum in segment file: "
+                        + fileMetadata.file(),
+                    fileMetadata.file(),
+                    e
+                );
+            }
+        }
+    }
+
+    @Override
+    public void deleteFile(UploadedSegmentMetadata uploadedSegmentMetadata) throws IOException {
+        FileMetadata fileMetadata = new FileMetadata(uploadedSegmentMetadata.getDataFormat(), uploadedSegmentMetadata.getUploadedFilename());
+        BlobContainer blobContainer = getBlobContainer(fileMetadata.dataFormat());
+        blobContainer.deleteBlobsIgnoringIfNotExists(Collections.singletonList(fileMetadata.file()));
     }
 
     /**
@@ -352,9 +409,6 @@ public class CompositeRemoteDirectory implements Closeable {
             if (blobContainer!=null) {
                 logger.debug("File {} already exists, using existing container", remoteFileName);
                 return new RemoteIndexOutput(remoteFileName, blobContainer);
-            }
-            else if(df !=null && df.equals("TempMetadata")) {
-                return new RemoteIndexOutput(remoteFileName, metadataBlobContainer);
             }
 
             throw new IOException(
@@ -407,52 +461,6 @@ public class CompositeRemoteDirectory implements Closeable {
             container.delete();
         }
         logger.debug("Deleted all format containers from CompositeRemoteDirectory");
-    }
-
-
-    /**
-     * Read the latest metadata file from the metadata blob container.
-     * This method provides compatibility with RemoteSegmentStoreDirectory.readLatestMetadataFile()
-     */
-    public RemoteSegmentMetadata readLatestMetadataFile() throws IOException {
-        try {
-            List<BlobMetadata> metadataFiles = metadataBlobContainer.listBlobsByPrefixInSortedOrder(
-                "metadata", 10, BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC);
-
-            if (metadataFiles.isEmpty()) {
-                logger.debug("No metadata files found in composite remote directory");
-                return null;
-            }
-
-            // Get the latest (first in reverse lexicographic order)
-            String latestMetadataFile = metadataFiles.get(0).name();
-            logger.debug("Reading latest metadata file: {}", latestMetadataFile);
-            return readMetadataFile(latestMetadataFile);
-        } catch (Exception e) {
-            logger.error("Failed to read latest metadata file from composite directory", e);
-            throw new IOException("Failed to read latest metadata file", e);
-        }
-    }
-
-    /**
-     * Read a specific metadata file by name from the metadata blob container.
-     * This method provides compatibility with RemoteSegmentStoreDirectory.readMetadataFile()
-     */
-    public RemoteSegmentMetadata readMetadataFile(String metadataFileName) throws IOException {
-        try (InputStream inputStream = metadataBlobContainer.readBlob(metadataFileName)) {
-            byte[] metadataBytes = inputStream.readAllBytes();
-
-            // Use our own metadata stream wrapper
-            return metadataStreamWrapper.readStream(
-                new ByteArrayIndexInput(metadataFileName, metadataBytes)
-            );
-        } catch (NoSuchFileException e) {
-            logger.debug("Metadata file not found: {}", metadataFileName);
-            return null;
-        } catch (Exception e) {
-            logger.error("Failed to read metadata file: {}", metadataFileName, e);
-            throw new IOException("Failed to read metadata file: " + metadataFileName, e);
-        }
     }
 
     @Override
