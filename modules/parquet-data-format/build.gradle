@@ -53,40 +53,28 @@ opensearchplugin {
   noticeFile = rootProject.file('NOTICE.txt')
 }
 
-// Include plugin security policy in bundle
-tasks.named('bundlePlugin').configure {
-  from('src/main/resources') {
-    include 'plugin-security.policy'
-  }
-}
-
 // This requires an additional Jar not published as part of build-tools
 loggerUsageCheck.enabled = false
 
 // No need to validate pom, as we do not upload to maven/sonatype
 validateNebulaPom.enabled = false
 
-// buildscript {
-//   ext {
-//     opensearch_version = System.getProperty("opensearch.version", "3.3.0-SNAPSHOT")
-//   }
-
-//   repositories {
-//     mavenLocal()
-//     maven { url = "https://central.sonatype.com/repository/maven-snapshots/" }
-//     mavenCentral()
-//     maven { url = "https://plugins.gradle.org/m2/" }
-//   }
-
-//   dependencies {
-//     classpath "org.opensearch.gradle:build-tools:${opensearch_version}"
-//     // Shadow plugin already included in build-tools
-//   }
-// }
-
+buildscript {
   ext {
     opensearch_version = System.getProperty("opensearch.version", "3.3.0")
   }
+
+  repositories {
+    mavenLocal()
+    maven { url = "https://central.sonatype.com/repository/maven-snapshots/" }
+    mavenCentral()
+    maven { url = "https://plugins.gradle.org/m2/" }
+  }
+
+  dependencies {
+    classpath "org.opensearch.gradle:build-tools:${opensearch_version}"
+  }
+}
 
 repositories {
   mavenLocal()
@@ -95,42 +83,11 @@ repositories {
   maven { url = "https://plugins.gradle.org/m2/" }
 }
 
-// Define configurations for JarJar shading
-configurations {
-  jarjar {
-    resolutionStrategy {
-      force 'org.codehaus.plexus:plexus-utils:3.0.22'
-    }
-  }
-  icebergBundle
-}
-
 configurations.all {
   resolutionStrategy {
     force 'commons-codec:commons-codec:1.18.0'
     force 'org.slf4j:slf4j-api:2.0.17'
   }
-
-  // Exclude conflicting dependencies to prevent jar hell
-  exclude group: 'org.slf4j', module: 'slf4j-log4j12'
-  exclude group: 'log4j', module: 'log4j'
-  exclude group: 'commons-logging', module: 'commons-logging'
-  exclude group: 'javax.servlet', module: 'servlet-api'
-  exclude group: 'org.eclipse.jetty'
-  exclude group: 'org.mortbay.jetty'
-  exclude group: 'it.unimi.dsi', module: 'fastutil'
-}
-
-sourceSets {
-  integTest {
-    java.srcDir 'src/integTest/java'
-    resources.srcDir 'src/integTest/resources'
-  }
-}
-
-configurations {
-  integTestImplementation.extendsFrom testImplementation
-  integTestRuntimeOnly.extendsFrom testRuntimeOnly
 }
 
 sourceSets {
@@ -157,7 +114,7 @@ dependencies {
   implementation 'org.apache.arrow:arrow-c-data:18.3.0'
 
   // Checker Framework annotations (required by Arrow)
-  implementation 'org.checkerframework:checker-qual:3.42.0'
+  implementation 'org.checkerframework:checker-qual:3.43.0'
 
   // Jackson dependencies required by Arrow
   implementation 'com.fasterxml.jackson.core:jackson-core:2.18.2'
@@ -186,12 +143,6 @@ dependencies {
 
   // DataFusion plugin for internalClusterTest
   internalClusterTestImplementation project(':plugins:engine-datafusion')
-
-  // Parquet dependencies for file operations
-  implementation 'org.apache.parquet:parquet-hadoop:1.15.0'
-  implementation 'org.apache.parquet:parquet-common:1.15.0'
-  implementation 'org.apache.parquet:parquet-encoding:1.15.0'
-  implementation 'org.apache.parquet:parquet-format-structures:1.15.0'
 }
 
 test {
@@ -200,10 +151,7 @@ test {
   if (JavaVersion.current().isJava9Compatible()) {
     jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
     jvmArgs '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED'
-    jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED'
-    jvmArgs '--add-opens=java.base/java.util=ALL-UNNAMED'
   }
-
 }
 
 task integTest(type: RestIntegTestTask) {
@@ -220,8 +168,6 @@ integTest {
   if (JavaVersion.current().isJava9Compatible()) {
     jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
     jvmArgs '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED'
-    jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED'
-    jvmArgs '--add-opens=java.base/java.util=ALL-UNNAMED'
   }
 
   // The --debug-jvm command-line option makes the cluster debuggable; this makes the tests debuggable
@@ -256,15 +202,6 @@ testClusters.integTest {
 
   // Install parquet-data-format plugin
   plugin(project.tasks.bundlePlugin.archiveFile)
-  // JVM args for reflection access needed by Iceberg's DynMethods
-  if (JavaVersion.current().isJava9Compatible()) {
-    jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED'
-    jvmArgs '--add-opens=java.base/java.lang.reflect=ALL-UNNAMED'
-  }
-  
-  // Enable reflection setAccessible for Iceberg
-  systemProperty 'io.netty.tryReflectionSetAccessible', 'true'
-
 
   // Install job-scheduler plugin from mavenLocal
   plugin(provider({
@@ -447,4 +384,3 @@ task updateVersion {
 
 // Disable specific license tasks
 licenseHeaders.enabled = false
-dependencyLicenses.enabled = false
