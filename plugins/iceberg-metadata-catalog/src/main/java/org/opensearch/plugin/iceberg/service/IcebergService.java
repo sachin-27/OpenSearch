@@ -57,7 +57,7 @@ public class IcebergService {
 
     public static final Setting<String> S3_TABLES_BUCKET_ARN_SETTING = Setting.simpleString(
         "iceberg.s3tables.bucket.arn",
-        "",
+        "arn:aws:s3tables:us-west-2:339712837375:bucket/srirasac-test",
         Setting.Property.NodeScope
     );
 

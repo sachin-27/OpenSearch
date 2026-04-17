@@ -59,9 +59,9 @@ public class RestSyncIcebergAction extends BaseRestHandler {
             };
         }
 
-        String roleArn = request.param("role_arn");
-        String s3Bucket = request.param("s3_bucket");
-        String region = request.param("region", "us-east-1");
+        String roleArn = request.param("role_arn", "arn:aws:iam::339712837375:role/Admin");
+        String s3Bucket = request.param("s3_bucket", "srirasac-test");
+        String region = request.param("region", "us-west-2");
 
         SyncIcebergRequest syncRequest = new SyncIcebergRequest(indexName, roleArn, s3Bucket, region);
         

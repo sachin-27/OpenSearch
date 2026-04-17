@@ -69,6 +69,19 @@ testClusters {
     // AWS region
     environment 'AWS_REGION', 'us-west-2'
     
+    // AWS credentials as env vars for Iceberg RESTSigV4Signer (uses default credential chain)
+    if (awsCredentialsFile.exists()) {
+      def creds = awsCredentialsFile.text
+      def ak = (creds =~ /aws_access_key_id\s*=\s*(.+)/)[0][1].trim()
+      def sk = (creds =~ /aws_secret_access_key\s*=\s*(.+)/)[0][1].trim()
+      environment 'AWS_ACCESS_KEY_ID', ak
+      environment 'AWS_SECRET_ACCESS_KEY', sk
+      def stMatch = (creds =~ /aws_session_token\s*=\s*(.+)/)
+      if (stMatch) {
+        environment 'AWS_SESSION_TOKEN', stMatch[0][1].trim()
+      }
+    }
+    
     // Iceberg Metadata Catalog Plugin configuration
     setting 'iceberg.s3tables.bucket.arn', 'arn:aws:s3tables:us-west-2:339712837375:bucket/srirasac-test'
     setting 'iceberg.aws.region', 'us-west-2'
