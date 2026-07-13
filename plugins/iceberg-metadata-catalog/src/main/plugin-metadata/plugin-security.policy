@@ -1,0 +1,29 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+grant {
+  // AWS SDK reflection
+  permission java.lang.RuntimePermission "accessDeclaredMembers";
+  permission java.lang.RuntimePermission "getClassLoader";
+  permission java.lang.RuntimePermission "setContextClassLoader";
+  permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
+
+  // Outbound network for STS, S3 Tables REST catalog, S3 file uploads
+  permission java.net.SocketPermission "*", "connect,resolve";
+
+  // AWS SDK auth / config properties
+  permission java.util.PropertyPermission "aws.sharedCredentialsFile", "read,write";
+  permission java.util.PropertyPermission "aws.configFile", "read,write";
+  permission java.util.PropertyPermission "opensearch.path.conf", "read,write";
+  permission java.util.PropertyPermission "opensearch.allow_insecure_settings", "read,write";
+
+  // Reading iceberg.credentials.file (an absolute path outside config/)
+  permission java.io.FilePermission "<<ALL_FILES>>", "read";
+
+  // Iceberg REST catalog + AWS SDK default authenticator
+  permission java.net.NetPermission "setDefaultAuthenticator";
+  permission java.net.NetPermission "getProxySelector";
+
+  permission java.lang.RuntimePermission "getFileStoreAttributes";
+};

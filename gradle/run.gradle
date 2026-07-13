@@ -40,6 +40,72 @@ testClusters {
     testDistribution = 'archive'
     if (numZones > 1) numberOfZones = numZones
     if (numNodes > 1) numberOfNodes = numNodes
+
+    // AWS credentials for S3 remote store - read from ~/.aws/credentials
+    def awsCredentialsFile = new File(System.getProperty("user.home"), ".aws/credentials")
+    if (awsCredentialsFile.exists()) {
+      def credentials = awsCredentialsFile.text
+      def accessKey = (credentials =~ /aws_access_key_id\s*=\s*(.+)/)[0][1].trim()
+      def secretKey = (credentials =~ /aws_secret_access_key\s*=\s*(.+)/)[0][1].trim()
+      keystore 's3.client.default.access_key', accessKey
+      keystore 's3.client.default.secret_key', secretKey
+
+      // Session token (optional for temporary credentials)
+      def sessionTokenMatch = (credentials =~ /aws_session_token\s*=\s*(.+)/)
+      if (sessionTokenMatch) {
+        def sessionToken = sessionTokenMatch[0][1].trim()
+        keystore 's3.client.default.session_token', sessionToken
+        println "Loaded AWS credentials with session token from ~/.aws/credentials"
+      } else {
+        println "Loaded AWS credentials from ~/.aws/credentials (no session token)"
+      }
+    } else {
+      println "WARNING: ~/.aws/credentials not found"
+    }
+
+    // AWS credentials for Iceberg are now loaded from iceberg.credentials.file setting
+    // Not using environment variables to avoid conflicts with ~/.aws/credentials
+
+    // AWS region
+    environment 'AWS_REGION', '<REGION>'
+
+    // AWS credentials as env vars for Iceberg RESTSigV4Signer (uses default credential chain)
+    if (awsCredentialsFile.exists()) {
+      def creds = awsCredentialsFile.text
+      def ak = (creds =~ /aws_access_key_id\s*=\s*(.+)/)[0][1].trim()
+      def sk = (creds =~ /aws_secret_access_key\s*=\s*(.+)/)[0][1].trim()
+      environment 'AWS_ACCESS_KEY_ID', ak
+      environment 'AWS_SECRET_ACCESS_KEY', sk
+      def stMatch = (creds =~ /aws_session_token\s*=\s*(.+)/)
+      if (stMatch) {
+        environment 'AWS_SESSION_TOKEN', stMatch[0][1].trim()
+      }
+    }
+
+    // Iceberg Metadata Catalog Plugin configuration
+    setting 'iceberg.s3tables.bucket.arn', 'arn:aws:s3tables:<REGION>:<ACCOUNT_ID>:bucket/<S3TABLES_BUCKET>'
+    setting 'iceberg.aws.region', '<REGION>'
+    setting 'iceberg.catalog.type', 's3tables'
+    setting 'iceberg.credentials.file', '<PATH_TO_ICEBERG_BOOTSTRAP_CREDENTIALS>'
+
+    // S3 remote store configuration (OpenSearch 3.x)
+    // Note: Remote store for segments/translog is enabled via node attributes, not cluster settings
+    setting 'cluster.remote_store.index.path.type', 'fixed'
+    setting 'node.attr.remote_store.repository.test-rs-repo.type', 's3'
+    setting 'node.attr.remote_store.repository.test-rs-repo.settings.bucket', '<REMOTE_STORE_BUCKET>'
+    setting 'node.attr.remote_store.repository.test-rs-repo.settings.base_path', 'repository'
+    setting 'node.attr.remote_store.repository.test-rs-repo.settings.region', '<REGION>'
+    setting 'node.attr.remote_store.segment.repository', 'test-rs-repo'
+    setting 'node.attr.remote_store.translog.repository', 'test-rs-repo'
+    setting 'node.attr.remote_store.state.repository', 'test-rs-repo'
+
+    println "Added AWS credentials to keystore and set AWS_REGION"
+    if (findProperty("enableSseKms")) {
+      setting 'node.attr.remote_store.repository.my-s3-repo.settings.server_side_encryption_type', 'aws:kms'
+      setting 'node.attr.remote_store.repository.my-s3-repo.settings.server_side_encryption_kms_key_id', 'arn:aws:kms:us-east-1:389347062219:key/006ef490-5452-4f4d-8da3-a0cb7344ab59'
+      setting 'node.attr.remote_store.repository.my-s3-repo.settings.server_side_encryption_bucket_key_enabled', findProperty("sseBucketKeyEnabled") ?: 'true'
+      setting 'node.attr.remote_store.repository.my-s3-repo.settings.server_side_encryption_encryption_context', '{"identifier":"mustang"}'
+    }
     if (findProperty("installedPlugins")) {
       installedPlugins = Eval.me(installedPlugins)
 
@@ -89,6 +155,8 @@ testClusters {
           systemProperty 'io.netty.noUnsafe', 'false'
           systemProperty 'io.netty.tryUnsafe', 'true'
           systemProperty 'io.netty.tryReflectionSetAccessible', 'true'
+          // Enable stream transport (required by analytics-engine / dsl-query-executor)
+          systemProperty 'opensearch.experimental.feature.transport.stream.enabled', 'true'
         }
         if (p.equals("parquet-data-format") || p.equals("analytics-backend-datafusion")) {
           // Composite engine / DataFusion requires pluggable dataformat feature flag

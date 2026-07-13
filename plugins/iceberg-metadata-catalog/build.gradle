@@ -1,0 +1,136 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+apply plugin: 'opensearch.opensearchplugin'
+apply plugin: 'opensearch.java-rest-test'
+
+opensearchplugin {
+    name = 'iceberg-metadata-catalog'
+    description = 'Plugin for managing Iceberg table metadata for OpenSearch indices'
+    classname = 'org.opensearch.plugin.iceberg.IcebergMetadataCatalogPlugin'
+    licenseFile = rootProject.file('LICENSE.txt')
+    noticeFile = rootProject.file('NOTICE.txt')
+}
+
+def icebergVersion = '1.6.1'
+def awsVersion = '2.32.29'
+
+configurations.all {
+    resolutionStrategy {
+        force "commons-codec:commons-codec:${versions.commonscodec}"
+        force "org.slf4j:slf4j-api:${versions.slf4j}"
+        force "com.fasterxml.jackson.core:jackson-core:${versions.jackson}"
+        force "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
+        force "com.fasterxml.jackson.core:jackson-annotations:${versions.jackson_annotations}"
+    }
+    exclude group: 'org.slf4j', module: 'slf4j-log4j12'
+    exclude group: 'log4j', module: 'log4j'
+}
+
+dependencies {
+    // --- Iceberg (REST catalog + table operations) ---
+    api("org.apache.iceberg:iceberg-core:${icebergVersion}") {
+        exclude group: 'org.apache.hadoop'
+        exclude group: 'org.slf4j'
+    }
+    api("org.apache.iceberg:iceberg-api:${icebergVersion}") {
+        exclude group: 'org.slf4j'
+    }
+    api("org.apache.iceberg:iceberg-common:${icebergVersion}") {
+        exclude group: 'org.slf4j'
+    }
+    api("org.apache.iceberg:iceberg-bundled-guava:${icebergVersion}") {
+        exclude group: 'org.slf4j'
+    }
+    // iceberg-aws: needed by existing POC code (S3FileIO, S3FileIOProperties).
+    // Will be removed when POC code is replaced with copied S3BlobContainer approach.
+    api("org.apache.iceberg:iceberg-aws:${icebergVersion}") {
+        exclude group: 'org.apache.hadoop'
+        exclude group: 'org.slf4j'
+        exclude group: 'software.amazon.awssdk', module: 'glue'
+        exclude group: 'software.amazon.awssdk', module: 'dynamodb'
+    }
+
+    // Avro (required by Iceberg DataFiles)
+    api 'org.apache.avro:avro:1.11.3'
+
+    // HttpClient 5 (required by Iceberg RESTCatalog)
+    api('org.apache.httpcomponents.client5:httpclient5:5.2.1') { exclude group: 'org.slf4j' }
+    api('org.apache.httpcomponents.core5:httpcore5:5.2') { exclude group: 'org.slf4j' }
+    api('org.apache.httpcomponents.core5:httpcore5-h2:5.2') { exclude group: 'org.slf4j' }
+
+    // Caffeine (required by Iceberg catalog caching)
+    api 'com.github.ben-manes.caffeine:caffeine:2.9.3'
+
+    // --- Logging (SLF4J bridge to Log4j2) ---
+    api "org.slf4j:slf4j-api:${versions.slf4j}"
+    api "org.apache.logging.log4j:log4j-slf4j2-impl:${versions.log4j}"
+
+    // --- Jackson (align with OpenSearch core) ---
+    api "com.fasterxml.jackson.core:jackson-core:${versions.jackson}"
+    api "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
+    api "com.fasterxml.jackson.core:jackson-annotations:${versions.jackson_annotations}"
+
+    // --- AWS SDK v2 (for copied S3BlobContainer code) ---
+    api "software.amazon.awssdk:sdk-core:${awsVersion}"
+    api "software.amazon.awssdk:aws-core:${awsVersion}"
+    api "software.amazon.awssdk:auth:${awsVersion}"
+    api "software.amazon.awssdk:identity-spi:${awsVersion}"
+    api "software.amazon.awssdk:checksums:${awsVersion}"
+    api "software.amazon.awssdk:checksums-spi:${awsVersion}"
+    api "software.amazon.awssdk:http-auth:${awsVersion}"
+    api "software.amazon.awssdk:http-auth-aws:${awsVersion}"
+    api "software.amazon.awssdk:http-auth-spi:${awsVersion}"
+    api "software.amazon.awssdk:retries:${awsVersion}"
+    api "software.amazon.awssdk:retries-spi:${awsVersion}"
+    api "software.amazon.awssdk:endpoints-spi:${awsVersion}"
+    api "software.amazon.awssdk:http-client-spi:${awsVersion}"
+    api "software.amazon.awssdk:apache-client:${awsVersion}"
+    api "software.amazon.awssdk:metrics-spi:${awsVersion}"
+    api "software.amazon.awssdk:profiles:${awsVersion}"
+    api "software.amazon.awssdk:regions:${awsVersion}"
+    api "software.amazon.awssdk:utils:${awsVersion}"
+    api "software.amazon.awssdk:annotations:${awsVersion}"
+    api "software.amazon.awssdk:protocol-core:${awsVersion}"
+    api "software.amazon.awssdk:json-utils:${awsVersion}"
+    api "software.amazon.awssdk:third-party-jackson-core:${awsVersion}"
+    api "software.amazon.awssdk:signer:${awsVersion}"
+    api "software.amazon.awssdk:s3:${awsVersion}"
+    api "software.amazon.awssdk:aws-xml-protocol:${awsVersion}"
+    api "software.amazon.awssdk:aws-json-protocol:${awsVersion}"
+    api "software.amazon.awssdk:aws-query-protocol:${awsVersion}"
+    api "software.amazon.awssdk:sts:${awsVersion}"
+    api "software.amazon.awssdk:netty-nio-client:${awsVersion}"
+    api "software.amazon.awssdk:crt-core:${awsVersion}"
+    api "software.amazon.awssdk:aws-crt-client:${awsVersion}"
+    api "software.amazon.awssdk.crt:aws-crt:0.35.0"
+
+    // --- Netty (required by copied S3 async upload code) ---
+    api "io.netty:netty-buffer:${versions.netty}"
+    api "io.netty:netty-codec:${versions.netty}"
+    api "io.netty:netty-codec-http:${versions.netty}"
+    api "io.netty:netty-codec-http2:${versions.netty}"
+    api "io.netty:netty-common:${versions.netty}"
+    api "io.netty:netty-handler:${versions.netty}"
+    api "io.netty:netty-resolver:${versions.netty}"
+    api "io.netty:netty-transport:${versions.netty}"
+    api "io.netty:netty-transport-native-unix-common:${versions.netty}"
+    api "io.netty:netty-transport-classes-epoll:${versions.netty}"
+
+    // --- Other (required by AWS SDK / copied S3 code) ---
+    api 'org.reactivestreams:reactive-streams:1.0.4'
+    api "org.apache.httpcomponents:httpclient:${versions.httpclient}"
+    api "org.apache.httpcomponents:httpcore:${versions.httpcore}"
+    api "commons-codec:commons-codec:${versions.commonscodec}"
+    api 'commons-logging:commons-logging:1.2'
+}
+
+licenseHeaders.enabled = false
+dependencyLicenses.enabled = false
+javadoc.enabled = false
+missingJavadoc.enabled = false
