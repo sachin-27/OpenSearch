@@ -318,7 +318,7 @@ public class LuceneWriterSortedFlushTests extends LucenePluginBaseTests {
                 input.setRowId(LuceneDocumentInput.ROW_ID_FIELD, i);
                 // Marker doc value uniquely tied to row ID — would diverge from row ID
                 // if any reordering had taken place.
-                input.getFinalInput().add(new SortedNumericDocValuesField("marker", i * 100L));
+                input.getFinalInput().get(0).add(new SortedNumericDocValuesField("marker", i * 100L));
                 writer.addDoc(input);
             }
 
@@ -380,7 +380,7 @@ public class LuceneWriterSortedFlushTests extends LucenePluginBaseTests {
             for (int i = 0; i < numDocs; i++) {
                 LuceneDocumentInput input = new LuceneDocumentInput();
                 input.setRowId(LuceneDocumentInput.ROW_ID_FIELD, i);
-                input.getFinalInput().add(new SortedNumericDocValuesField("age", ages[i]));
+                input.getFinalInput().get(0).add(new SortedNumericDocValuesField("age", ages[i]));
                 writer.addDoc(input);
             }
 
@@ -437,7 +437,7 @@ public class LuceneWriterSortedFlushTests extends LucenePluginBaseTests {
                 LuceneDocumentInput input = new LuceneDocumentInput();
                 input.addField(textField, "doc_" + i);
                 input.setRowId(LuceneDocumentInput.ROW_ID_FIELD, i);
-                input.getFinalInput().add(new SortedNumericDocValuesField("age", i));
+                input.getFinalInput().get(0).add(new SortedNumericDocValuesField("age", i));
                 writer.addDoc(input);
             }
 
@@ -500,7 +500,7 @@ public class LuceneWriterSortedFlushTests extends LucenePluginBaseTests {
                 input.addField(textField, "doc_" + i);
                 input.setRowId(LuceneDocumentInput.ROW_ID_FIELD, i);
                 // User field: doc i carries score i*100
-                input.getFinalInput().add(new SortedNumericDocValuesField("score", i * 100L));
+                input.getFinalInput().get(0).add(new SortedNumericDocValuesField("score", i * 100L));
                 writer.addDoc(input);
             }
 
@@ -589,7 +589,7 @@ public class LuceneWriterSortedFlushTests extends LucenePluginBaseTests {
                 LuceneDocumentInput input = new LuceneDocumentInput();
                 input.addField(textField, "doc_" + i);
                 input.setRowId(LuceneDocumentInput.ROW_ID_FIELD, i);
-                input.getFinalInput().add(new SortedNumericDocValuesField("marker", i * 100L));
+                input.getFinalInput().get(0).add(new SortedNumericDocValuesField("marker", i * 100L));
                 writer.addDoc(input);
             }
 

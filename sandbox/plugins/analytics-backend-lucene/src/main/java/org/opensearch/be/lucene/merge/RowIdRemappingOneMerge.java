@@ -18,6 +18,7 @@ import org.opensearch.index.engine.dataformat.RowIdMapping;
 import java.io.IOException;
 import java.util.List;
 
+import static org.opensearch.be.lucene.index.LuceneWriter.NESTED_BLOCKS_ATTRIBUTE;
 import static org.opensearch.be.lucene.index.LuceneWriter.WRITER_GENERATION_ATTRIBUTE;
 
 /**
@@ -43,13 +44,35 @@ class RowIdRemappingOneMerge extends MergePolicy.OneMerge {
 
     private final RowIdMapping rowIdMapping;
     private final long outputWriterGeneration;
+    private final boolean nestedBlocks;
+    /** Shared block-aware mapping expansion for this merge, or null for flat merges. */
+    private final NestedBlockExpansion expansion;
     private int nextRowIdOffset;
 
     RowIdRemappingOneMerge(List<SegmentCommitInfo> segments, RowIdMapping rowIdMapping, long outputWriterGeneration) {
         super(segments);
         this.rowIdMapping = rowIdMapping;
         this.outputWriterGeneration = outputWriterGeneration;
+        this.nestedBlocks = anyNestedBlocks(segments);
+        // Row ids are plain sequential in ALL segments (Scheme C), so nested and flat
+        // sources mix freely: a flat segment scans as all blocks-of-one. The expansion is
+        // only needed (and its scan cost only paid) when at least one source may contain
+        // multi-doc blocks; flat-only merges keep the legacy one-row-id-per-doc path.
+        this.expansion = nestedBlocks && rowIdMapping != null ? new NestedBlockExpansion(rowIdMapping, segments.size()) : null;
         this.nextRowIdOffset = 0;
+    }
+
+    /**
+     * Returns whether any source segment was produced by a nested-blocks index, from the
+     * {@code nested_blocks} segment attribute stamped by the writer at flush time.
+     */
+    private static boolean anyNestedBlocks(List<SegmentCommitInfo> segments) {
+        for (SegmentCommitInfo sci : segments) {
+            if (Boolean.parseBoolean(sci.info.getAttribute(NESTED_BLOCKS_ATTRIBUTE))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
@@ -58,7 +81,8 @@ class RowIdRemappingOneMerge extends MergePolicy.OneMerge {
         long generation = resolveGeneration(wrapped);
         int offset = nextRowIdOffset;
         nextRowIdOffset += wrapped.maxDoc();
-        return new RowIdRemappingCodecReader(wrapped, rowIdMapping, generation, offset);
+        NestedBlockExpansion.SegmentExpansion segmentExpansion = expansion == null ? null : expansion.register(wrapped, generation);
+        return new RowIdRemappingCodecReader(wrapped, rowIdMapping, generation, offset, segmentExpansion);
     }
 
     /**
@@ -77,6 +101,11 @@ class RowIdRemappingOneMerge extends MergePolicy.OneMerge {
         super.setMergeInfo(info);
         if (info != null) {
             info.info.putAttribute(WRITER_GENERATION_ATTRIBUTE, String.valueOf(outputWriterGeneration));
+            if (nestedBlocks) {
+                // The merged segment inherits the nested-blocks marker so subsequent
+                // merges expand the mapping block-aware for it too.
+                info.info.putAttribute(NESTED_BLOCKS_ATTRIBUTE, "true");
+            }
         }
     }
 

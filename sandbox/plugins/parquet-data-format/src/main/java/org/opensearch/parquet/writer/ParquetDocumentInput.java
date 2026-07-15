@@ -12,6 +12,8 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.index.engine.dataformat.DocumentInput;
 import org.opensearch.index.engine.dataformat.FieldTypeCapabilities;
+import org.opensearch.index.engine.dataformat.NestedScope;
+import org.opensearch.index.engine.dataformat.NestedScopeTracker;
 import org.opensearch.index.engine.exec.PrimaryTermFieldType;
 import org.opensearch.index.mapper.IdFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
@@ -24,6 +26,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -40,7 +43,15 @@ public class ParquetDocumentInput implements DocumentInput<List<FieldValuePair>>
 
     private static final Logger logger = LogManager.getLogger(ParquetDocumentInput.class);
     private final List<FieldValuePair> collectedFields = new ArrayList<>();
-    private final Set<MappedFieldType> dedup = Collections.newSetFromMap(new IdentityHashMap<>());
+    /**
+     * One-value-per-field is enforced per scope: the root document and each nested child
+     * (e.g. comments[0], comments[1]) are independent scopes, so the same nested field
+     * type may legitimately appear once per child. Keyed by the active {@link NestedScope}
+     * instance (root uses a sentinel), with identity-based field-type sets as before.
+     */
+    private final Map<Object, Set<MappedFieldType>> dedupByScope = new IdentityHashMap<>();
+    private static final Object ROOT_SCOPE_KEY = new Object();
+    private final NestedScopeTracker scopeTracker = new NestedScopeTracker();
     private long rowId = -1;
     private boolean isClosed = false;
 
@@ -54,12 +65,32 @@ public class ParquetDocumentInput implements DocumentInput<List<FieldValuePair>>
             logger.trace("Ignored to add field: {} {}", fieldType.name(), fieldType.getCapabilityMap());
             return;
         }
+        NestedScope scope = scopeTracker.current();
+        Object scopeKey = scope == null ? ROOT_SCOPE_KEY : scope;
+        Set<MappedFieldType> dedup = dedupByScope.computeIfAbsent(scopeKey, k -> Collections.newSetFromMap(new IdentityHashMap<>()));
         if (dedup.add(fieldType) == false) {
             throw new MapperParsingException(
-                "Cannot accept multiple values for field: [" + fieldType.name() + "] of type: [" + fieldType.typeName() + "]."
+                "Cannot accept multiple values for field: ["
+                    + fieldType.name()
+                    + "] of type: ["
+                    + fieldType.typeName()
+                    + "]"
+                    + (scope == null ? "." : " within nested element [" + scope.positionalPath() + "].")
             );
         }
-        collectedFields.add(new FieldValuePair(fieldType, value));
+        collectedFields.add(new FieldValuePair(fieldType, value, scope));
+    }
+
+    @Override
+    public void beginChild(String nestedPath) {
+        ensureOpen();
+        scopeTracker.beginChild(nestedPath);
+    }
+
+    @Override
+    public void endChild() {
+        ensureOpen();
+        scopeTracker.endChild();
     }
 
     @Override
@@ -91,6 +122,8 @@ public class ParquetDocumentInput implements DocumentInput<List<FieldValuePair>>
     public void close() {
         isClosed = true;
         collectedFields.clear();
+        dedupByScope.clear();
+        scopeTracker.reset();
         rowId = -1;
     }
 
@@ -107,5 +140,17 @@ public class ParquetDocumentInput implements DocumentInput<List<FieldValuePair>>
      */
     public long getRowId() {
         return rowId;
+    }
+
+    /**
+     * Returns every nested child scope of this document in parse (depth-first) order —
+     * including scopes whose fields were all filtered out by capability checks, so that
+     * list element positions stay aligned with the Lucene block ordinals even for
+     * children that contribute no Parquet columns.
+     *
+     * @return all nested scopes in parse order; empty for flat documents
+     */
+    public List<NestedScope> getNestedScopes() {
+        return scopeTracker.scopesInParseOrder();
     }
 }

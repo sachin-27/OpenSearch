@@ -77,6 +77,22 @@ public class CompositeDocumentInput implements DocumentInput<List<? extends Docu
     }
 
     @Override
+    public void beginChild(String nestedPath) {
+        primaryDocumentInput.beginChild(nestedPath);
+        for (DocumentInput<?> input : secondaryDocumentInputs.values()) {
+            input.beginChild(nestedPath);
+        }
+    }
+
+    @Override
+    public void endChild() {
+        primaryDocumentInput.endChild();
+        for (DocumentInput<?> input : secondaryDocumentInputs.values()) {
+            input.endChild();
+        }
+    }
+
+    @Override
     public void setRowId(String rowIdFieldName, long rowId) {
         primaryDocumentInput.setRowId(rowIdFieldName, rowId);
         for (DocumentInput<?> input : secondaryDocumentInputs.values()) {

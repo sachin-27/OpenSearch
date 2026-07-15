@@ -607,6 +607,12 @@ final class DocumentParser {
         ObjectMapper.Nested nested = mapper.nested();
         if (nested.isNested()) {
             context = nestedContext(context, mapper);
+            // Mirror the nested-document boundary into the pluggable data format input (one
+            // beginChild/endChild pair per nested array element) so buffered field values are
+            // qualified by the child they belong to. Null in the vanilla (non-pluggable) path.
+            if (context.documentInput() != null) {
+                context.documentInput().beginChild(mapper.fullPath());
+            }
         }
 
         // if we are at the end of the previous object, advance
@@ -622,6 +628,9 @@ final class DocumentParser {
 
         // restore the enable path flag
         if (nested.isNested()) {
+            if (context.documentInput() != null) {
+                context.documentInput().endChild();
+            }
             nested(context, nested);
         }
     }
@@ -840,9 +849,14 @@ final class DocumentParser {
             // We just need to store the id as indexed field, so that IndexWriter#deleteDocuments(term) can then
             // delete it when the root document is deleted too.
             nestedDoc.add(new Field(IdFieldMapper.NAME, idField.binaryValue(), IdFieldMapper.Defaults.NESTED_FIELD_TYPE));
-        } else {
+        } else if (context.indexSettings().isPluggableDataFormatEnabled() == false) {
             throw new IllegalStateException("The root document of a nested document should have an _id field");
         }
+        // POC(nested): in pluggable/composite mode, field values (including _id) route to the
+        // DocumentInput rather than ParseContext.Document, so the vanilla per-Document _id copy
+        // isn't populated here. The nested Lucene block is built by the format's DocumentInput
+        // from the beginChild/endChild signals instead; restoring the per-child _id (needed for
+        // whole-block deleteDocuments(term)) is tracked as follow-up work.
 
         // the type of the nested doc starts with __, so we can identify that its a nested one in filters
         // note, we don't prefix it with the type of the doc since it allows us to execute a nested query

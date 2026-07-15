@@ -43,6 +43,7 @@ import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.collect.CopyOnWriteHashMap;
 import org.opensearch.common.logging.DeprecationLogger;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.util.FeatureFlags;
 import org.opensearch.common.xcontent.support.XContentMapValues;
 import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -427,7 +428,10 @@ public class ObjectMapper extends Mapper implements Cloneable {
                 if (type.equals(CONTENT_TYPE)) {
                     builder.nested = Nested.NO;
                 } else if (type.equals(NESTED_CONTENT_TYPE)) {
-                    if (isPluggableDataFormatEnabled(parserContext.getSettings())) {
+                    // Nested support for the composite engine is under development; allow it only
+                    // behind the experimental nested feature flag so the default remains fail-fast.
+                    if (isPluggableDataFormatEnabled(parserContext.getSettings())
+                        && FeatureFlags.isEnabled(FeatureFlags.PLUGGABLE_DATAFORMAT_NESTED_EXPERIMENTAL_FLAG) == false) {
                         throw new MapperParsingException("nested type is not supported with pluggable data format on field [" + name + "]");
                     }
                     nested = true;
@@ -1085,6 +1089,14 @@ public class ObjectMapper extends Mapper implements Cloneable {
 
     @Override
     public void canDeriveSource() {
+        // POC(nested): composite indices force derived-source validation, which would
+        // reject nested mappings before the composite engine ever sees them. Behind the
+        // experimental nested flag, let nested objects pass validation (real derived-source
+        // reconstruction of nested fields from the LIST<STRUCT> column is future work).
+        // Default (flag off) keeps vanilla's fail-fast behavior unchanged.
+        if (this.nested.isNested() && FeatureFlags.isEnabled(FeatureFlags.PLUGGABLE_DATAFORMAT_NESTED_EXPERIMENTAL_FLAG)) {
+            return;
+        }
         if (!this.enabled.value() || this.nested.isNested()) {
             throw new UnsupportedOperationException("Derived source is not supported for " + name() + " field as it is disabled/nested");
         }

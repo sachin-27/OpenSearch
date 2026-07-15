@@ -210,6 +210,12 @@ public class VSRManager implements AutoCloseable {
         }
         ManagedVSR activeVSR = managedVSR.get();
         for (FieldValuePair pair : doc.getFinalInput()) {
+            if (pair.isNested()) {
+                // Scope-qualified values are written together into their LIST<STRUCT>
+                // vectors after this loop — the nested writer needs the row's full scope
+                // tree at once, not one pair at a time.
+                continue;
+            }
             MappedFieldType fieldType = pair.getFieldType();
             ParquetField parquetField = ArrowFieldRegistry.getParquetField(fieldType.typeName());
             if (parquetField == null) {
@@ -238,6 +244,9 @@ public class VSRManager implements AutoCloseable {
             parquetField.createField(fieldType, activeVSR, pair.getValue());
         }
         int rowIndex = activeVSR.getRowCount();
+        // Nested children: fold the document's scope-qualified values into the row's
+        // LIST<STRUCT> columns, positions aligned with the parse-time scope ordinals.
+        NestedVectorWriter.write(activeVSR::getVector, rowIndex, doc.getNestedScopes(), doc.getFinalInput());
         BigIntVector rowIdVector = (BigIntVector) activeVSR.getVector(DocumentInput.ROW_ID_FIELD);
         if (rowIdVector != null) {
             rowIdVector.setSafe(rowIndex, doc.getRowId());
@@ -266,7 +275,9 @@ public class VSRManager implements AutoCloseable {
         boolean changed = false;
         for (Field schemaField : newSchema.getFields()) {
             if (activeVSR.getVector(schemaField.getName()) == null) {
-                Field field = new Field(schemaField.getName(), schemaField.getFieldType(), null);
+                // Preserve children so LIST<STRUCT> fields keep their struct tree; passing
+                // null here would silently strip a nested column down to an empty list.
+                Field field = new Field(schemaField.getName(), schemaField.getFieldType(), schemaField.getChildren());
                 activeVSR.addFieldVector(field);
                 changed = true;
             }

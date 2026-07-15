@@ -86,4 +86,93 @@ public class ParquetDocumentInputTests extends ParquetBaseTests {
         input.addField(valField, 10);
         expectThrows(MapperParsingException.class, () -> input.addField(valField, 20));
     }
+
+    /**
+     * The two-comment scenario: the same nested field appearing once per child must be
+     * accepted (one scope each), where the flat dedup used to reject the second value.
+     */
+    public void testSameFieldAcceptedAcrossNestedSiblings() {
+        ParquetDocumentInput input = new ParquetDocumentInput();
+        populateMetadataFields(input);
+        input.setRowId(DocumentInput.ROW_ID_FIELD, 0L);
+        MappedFieldType author = new KeywordFieldMapper.KeywordFieldType("comments.author");
+        assignTestCapabilities(author, PARQUET_FORMAT);
+
+        input.beginChild("comments");
+        input.addField(author, "alice");
+        input.endChild();
+
+        input.beginChild("comments");
+        input.addField(author, "dave");
+        input.endChild();
+
+        List<FieldValuePair> pairs = nestedPairs(input);
+        assertEquals(2, pairs.size());
+        assertEquals("comments[0]", pairs.get(0).getScope().positionalPath());
+        assertEquals("alice", pairs.get(0).getValue());
+        assertEquals("comments[1]", pairs.get(1).getScope().positionalPath());
+        assertEquals("dave", pairs.get(1).getValue());
+    }
+
+    /** Duplicate values within the SAME child are still rejected. */
+    public void testRejectsDuplicateFieldWithinOneNestedChild() {
+        ParquetDocumentInput input = new ParquetDocumentInput();
+        MappedFieldType author = new KeywordFieldMapper.KeywordFieldType("comments.author");
+        assignTestCapabilities(author, PARQUET_FORMAT);
+
+        input.beginChild("comments");
+        input.addField(author, "alice");
+        MapperParsingException e = expectThrows(MapperParsingException.class, () -> input.addField(author, "alice-again"));
+        assertTrue(e.getMessage().contains("comments[0]"));
+    }
+
+    /** Root fields and nested fields dedup independently; root pairs carry no scope. */
+    public void testRootAndNestedScopesAreIndependent() {
+        ParquetDocumentInput input = new ParquetDocumentInput();
+        populateMetadataFields(input);
+        input.setRowId(DocumentInput.ROW_ID_FIELD, 0L);
+        MappedFieldType title = new KeywordFieldMapper.KeywordFieldType("title");
+        MappedFieldType author = new KeywordFieldMapper.KeywordFieldType("comments.author");
+        assignTestCapabilities(title, PARQUET_FORMAT);
+        assignTestCapabilities(author, PARQUET_FORMAT);
+
+        input.addField(title, "First post");
+        input.beginChild("comments");
+        input.addField(author, "alice");
+        input.endChild();
+
+        List<FieldValuePair> all = input.getFinalInput();
+        FieldValuePair titlePair = all.stream().filter(p -> p.getFieldType() == title).findFirst().orElseThrow();
+        FieldValuePair authorPair = all.stream().filter(p -> p.getFieldType() == author).findFirst().orElseThrow();
+        assertFalse(titlePair.isNested());
+        assertNull(titlePair.getScope());
+        assertTrue(authorPair.isNested());
+    }
+
+    /** Two-level nesting: replies within comments carry the full positional path. */
+    public void testMultiLevelNestedScopes() {
+        ParquetDocumentInput input = new ParquetDocumentInput();
+        populateMetadataFields(input);
+        input.setRowId(DocumentInput.ROW_ID_FIELD, 0L);
+        MappedFieldType user = new KeywordFieldMapper.KeywordFieldType("comments.replies.user");
+        assignTestCapabilities(user, PARQUET_FORMAT);
+
+        input.beginChild("comments");
+        input.beginChild("comments.replies");
+        input.addField(user, "bob");
+        input.endChild();
+        input.beginChild("comments.replies");
+        input.addField(user, "carol");
+        input.endChild();
+        input.endChild();
+
+        List<FieldValuePair> pairs = nestedPairs(input);
+        assertEquals("comments[0].replies[0]", pairs.get(0).getScope().positionalPath());
+        assertEquals("comments[0].replies[1]", pairs.get(1).getScope().positionalPath());
+    }
+
+    /** Returns only the nested-scoped pairs, in insertion order (metadata/root pairs filtered out). */
+    private static List<FieldValuePair> nestedPairs(ParquetDocumentInput input) {
+        return input.getFinalInput().stream().filter(FieldValuePair::isNested).toList();
+    }
 }

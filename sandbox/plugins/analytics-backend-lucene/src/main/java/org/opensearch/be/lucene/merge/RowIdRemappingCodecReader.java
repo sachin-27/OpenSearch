@@ -31,18 +31,28 @@ class RowIdRemappingCodecReader extends FilterCodecReader {
     private final RowIdMapping rowIdMapping;
     private final long generation;
     private final int rowIdOffset;
+    private final NestedBlockExpansion.SegmentExpansion expansion;
 
     /**
      * @param in           the source codec reader to wrap
      * @param rowIdMapping the mapping from old to new row IDs, or null for sequential assignment
      * @param generation   the writer generation of this segment
      * @param rowIdOffset  the starting row ID offset for sequential assignment
+     * @param expansion    this segment's slice of the block-aware mapping expansion, or
+     *                     null for flat merges (mapping applied one-row-id-per-doc)
      */
-    RowIdRemappingCodecReader(CodecReader in, RowIdMapping rowIdMapping, long generation, int rowIdOffset) {
+    RowIdRemappingCodecReader(
+        CodecReader in,
+        RowIdMapping rowIdMapping,
+        long generation,
+        int rowIdOffset,
+        NestedBlockExpansion.SegmentExpansion expansion
+    ) {
         super(in);
         this.rowIdMapping = rowIdMapping;
         this.generation = generation;
         this.rowIdOffset = rowIdOffset;
+        this.expansion = expansion;
     }
 
     @Override
@@ -51,7 +61,7 @@ class RowIdRemappingCodecReader extends FilterCodecReader {
         if (delegate == null) {
             return null;
         }
-        return new RowIdRemappingDocValuesProducer(delegate, rowIdMapping, generation, in.maxDoc(), rowIdOffset);
+        return new RowIdRemappingDocValuesProducer(delegate, rowIdMapping, generation, in.maxDoc(), rowIdOffset, expansion);
     }
 
     @Override

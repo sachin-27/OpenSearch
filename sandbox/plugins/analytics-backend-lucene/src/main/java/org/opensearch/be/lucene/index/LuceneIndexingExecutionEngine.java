@@ -242,7 +242,31 @@ public class LuceneIndexingExecutionEngine implements IndexingExecutionEngine<Lu
         Set<LuceneWriter> registry,
         LuceneShardStatsTracker stats
     ) throws IOException {
-        return new LuceneWriter(writerGeneration, mappingVersion, dataFormat, baseDirectory, analyzer, codec, indexSort, registry, stats);
+        return new LuceneWriter(
+            writerGeneration,
+            mappingVersion,
+            dataFormat,
+            baseDirectory,
+            analyzer,
+            codec,
+            indexSort,
+            registry,
+            stats,
+            useNestedBlocks()
+        );
+    }
+
+    /**
+     * Returns whether this index uses nested document blocks: enabled when the mapping
+     * contains any {@code nested} field. Row ids stay plain sequential either way
+     * (Scheme C — {@code __row_id__ == docId}); this flag only controls block building,
+     * writer-side stamping, the parent field, and the merge path's block-aware mapping
+     * expansion. A mapping update that introduces the first nested field mid-generation
+     * is therefore benign for the row-id scheme (unlike stored composite keys) — new
+     * segments simply start carrying the nested-blocks attribute.
+     */
+    private boolean useNestedBlocks() {
+        return mapperService != null && mapperService.hasNested();
     }
 
     private Sort getChildWriterSortConfiguration() {
@@ -280,7 +304,7 @@ public class LuceneIndexingExecutionEngine implements IndexingExecutionEngine<Lu
      */
     @Override
     public LuceneDocumentInput newDocumentInput() {
-        return new LuceneDocumentInput(fieldFactoryRegistry);
+        return new LuceneDocumentInput(fieldFactoryRegistry, useNestedBlocks());
     }
 
     /** {@inheritDoc} Returns the {@link LuceneDataFormat} descriptor. */
@@ -375,7 +399,16 @@ public class LuceneIndexingExecutionEngine implements IndexingExecutionEngine<Lu
                             if (!writerGenerations.contains(writerGen)) {
                                 continue;
                             }
+                            // numRows is the cross-format LOGICAL row count (what Parquet
+                            // reports for the same generation). For nested-blocks segments,
+                            // physical docs outnumber logical rows (N+1 per block), so
+                            // subtract the child docs (identified by _nested_path); the
+                            // parents that remain are the logical rows. Flat segments are
+                            // untouched (maxDoc == logical rows).
                             long numDocs = segReader.maxDoc();
+                            if (Boolean.parseBoolean(segInfo.info.getAttribute(LuceneWriter.NESTED_BLOCKS_ATTRIBUTE))) {
+                                numDocs -= LuceneWriter.countNestedChildDocs(segReader);
+                            }
 
                             WriterFileSet.Builder wfsBuilder = WriterFileSet.builder()
                                 .directory(sharedDir)

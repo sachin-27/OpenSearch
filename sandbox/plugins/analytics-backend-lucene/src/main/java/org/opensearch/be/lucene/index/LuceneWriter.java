@@ -12,7 +12,9 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.codecs.Codec;
+import org.apache.lucene.document.Document;
 import org.apache.lucene.document.NumericDocValuesField;
+import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.index.CodecReader;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
@@ -28,6 +30,8 @@ import org.apache.lucene.index.SegmentInfos;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.Sorter;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.SortedNumericSortField;
@@ -50,6 +54,7 @@ import org.opensearch.index.engine.dataformat.WriteResult;
 import org.opensearch.index.engine.dataformat.Writer;
 import org.opensearch.index.engine.dataformat.WriterState;
 import org.opensearch.index.engine.exec.WriterFileSet;
+import org.opensearch.index.mapper.NestedPathFieldMapper;
 import org.opensearch.index.mapper.Uid;
 import org.opensearch.plugin.stats.StatsRecorder;
 
@@ -94,6 +99,27 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
     /** Segment info attribute key storing the writer generation for post-addIndexes correlation. */
     public static final String WRITER_GENERATION_ATTRIBUTE = "writer_generation";
 
+    /**
+     * Lucene parent field enabling document-block support with index sorting. Configured on
+     * every writer that produces nested blocks AND on the shared committer, so segments stay
+     * {@code addIndexes}-compatible and sorted merges move blocks atomically (children with
+     * their parent) instead of scattering them. Must not collide with any mapped field name.
+     */
+    public static final String NESTED_PARENT_FIELD = "__nested_parent";
+
+    /**
+     * Segment info attribute marking segments produced by a nested-blocks index. Row ids
+     * are plain sequential ({@code __row_id__ == docId}, invariant I1) in ALL segments;
+     * this attribute tells the merge path that the segment may contain nested blocks, so
+     * the logical-row mapping must be expanded through the segment's block structure
+     * (recovered from {@code _nested_path}) rather than applied one-row-id-per-doc.
+     * Persisted to the {@code .si} file (like {@link #WRITER_GENERATION_ATTRIBUTE}) and
+     * preserved through {@code addIndexes}. FieldInfos-based detection (parent field
+     * presence) is NOT sufficient: a nested-index segment whose documents are all
+     * childless has no blocks and thus no parent field.
+     */
+    public static final String NESTED_BLOCKS_ATTRIBUTE = "nested_blocks";
+
     /** Large RAM buffer to avoid intermediate segment flushes within a single writer in production. */
     private static final double RAM_BUFFER_SIZE_MB = 256.0;
 
@@ -104,8 +130,14 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
     private final Directory directory;
     private final IndexWriter indexWriter;
     private final Set<LuceneWriter> registry;
+    private final boolean nestedBlocks;
     private long mappingVersion;
+    /** Physical Lucene documents admitted (children + roots). Equals logicalRows when no nested docs exist. */
     private volatile long docCount;
+    /** Logical documents (blocks) admitted — the cross-format row space CompositeWriter accounts in. */
+    private volatile long logicalRows;
+    /** Physical doc count of the most recent block, for block-aware rollback accounting. */
+    private int lastBlockDocCount;
     private volatile boolean flushed;
     private volatile WriterState state = WriterState.ACTIVE;
 
@@ -133,11 +165,38 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
         Set<LuceneWriter> registry,
         LuceneShardStatsTracker stats
     ) throws IOException {
+        this(writerGeneration, mappingVersion, dataFormat, baseDirectory, analyzer, codec, indexSort, registry, stats, false);
+    }
+
+    /**
+     * Creates a new LuceneWriter with explicit nested-blocks support.
+     *
+     * @param nestedBlocks whether this index supports nested blocks (indices with nested
+     *                     mappings). Row ids stay plain sequential ({@code __row_id__ ==
+     *                     docId}) either way; in nested mode the writer stamps them itself
+     *                     (one per physical doc, children included) and configures the
+     *                     Lucene parent field for block-atomic sorting. Must match the mode
+     *                     of the {@link LuceneDocumentInput}s fed to this writer.
+     */
+    public LuceneWriter(
+        long writerGeneration,
+        long mappingVersion,
+        LuceneDataFormat dataFormat,
+        Path baseDirectory,
+        Analyzer analyzer,
+        Codec codec,
+        Sort indexSort,
+        Set<LuceneWriter> registry,
+        LuceneShardStatsTracker stats,
+        boolean nestedBlocks
+    ) throws IOException {
         this.writerGeneration = writerGeneration;
         this.mappingVersion = mappingVersion;
         this.dataFormat = dataFormat;
         this.stats = stats;
         this.docCount = 0;
+        this.logicalRows = 0;
+        this.nestedBlocks = nestedBlocks;
         this.registry = registry;
 
         // Create an isolated temp directory for this writer's segment
@@ -164,6 +223,13 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
         } else {
             // We are taking control here hence not allowing any merge to happen automatically.
             iwc.setMergePolicy(NoMergePolicy.INSTANCE);
+        }
+        if (nestedBlocks) {
+            // Nested blocks (addDocuments) + any downstream index sorting require a parent
+            // field. Configuring it here materializes the field in this segment's FieldInfos,
+            // which is what keeps the segment addIndexes-compatible with the shared committer
+            // (whose config declares the same field). Harmless for blocks-free documents.
+            iwc.setParentField(NESTED_PARENT_FIELD);
         }
         iwc.setCodec(new LuceneWriterCodec(codec, writerGeneration));
         this.indexWriter = new IndexWriter(directory, iwc);
@@ -228,26 +294,49 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
             if (state != WriterState.ACTIVE) {
                 throw new IllegalStateException("addDoc requires ACTIVE state but was " + state);
             }
-            // Defense-in-depth: CompositeWriter enforces rowId == docCount at the multiplexer
+            // Defense-in-depth: CompositeWriter enforces rowId == acceptedRows at the multiplexer
             // layer, but we re-check here so a single-format Lucene path is also protected.
-            if (input.getRowId() != docCount) {
-                throw new IllegalStateException("rowId [" + input.getRowId() + "] does not match doc count [" + docCount + "]");
+            // The row space is logical documents (blocks), not physical Lucene docs.
+            if (input.getRowId() != logicalRows) {
+                throw new IllegalStateException("rowId [" + input.getRowId() + "] does not match logical row count [" + logicalRows + "]");
+            }
+            List<Document> block = input.getFinalInput();
+            assert block.isEmpty() == false : "document block must contain at least the root document";
+            assert block.size() == 1 || nestedBlocks : "multi-doc blocks require nested-blocks mode";
+            if (nestedBlocks) {
+                // Scheme C: every physical doc — children and root — gets a plain sequential
+                // docId-space row id (__row_id__ == docId, invariant I1). The input defers
+                // stamping to us because only the writer knows the global doc offset.
+                for (int i = 0; i < block.size(); i++) {
+                    block.get(i).add(new SortedNumericDocValuesField(DocumentInput.ROW_ID_FIELD, docCount + i));
+                }
             }
             try {
-                indexWriter.addDocument(input.getFinalInput());
+                if (block.size() == 1) {
+                    indexWriter.addDocument(block.get(0));
+                } else {
+                    // Nested block: children first, root last, indexed atomically so Lucene
+                    // records the block structure (contiguous docIds, parent highest).
+                    indexWriter.addDocuments(block);
+                }
             } catch (IOException | IllegalArgumentException e) {
-                // Lucene's IndexWriter may have consumed a docId before throwing; advance our
-                // counter to match so rollbackTo can tombstone the partial slot, and
-                // retire to preserve the docId == rowId invariant for subsequent writes.
-                docCount++;
+                // Lucene's IndexWriter may have consumed docIds before throwing; advance our
+                // counters to match so rollbackTo can tombstone the partial block, and
+                // retire to preserve the row-id invariants for subsequent writes.
+                docCount += block.size();
+                logicalRows++;
+                lastBlockDocCount = block.size();
                 state = WriterState.PENDING_ROLLBACK;
                 stats.incDocsIndexedFailures();
                 return new WriteResult.Failure(e, -1L, -1L, -1L);
             }
-            long currentDocId = docCount;
-            docCount++;
-            stats.addDocsIndexed(1);
-            return new WriteResult.Success(1L, 1L, currentDocId);
+            // The block's identity is its root (parent) document — the last docId consumed.
+            long parentDocId = docCount + block.size() - 1;
+            docCount += block.size();
+            logicalRows++;
+            lastBlockDocCount = block.size();
+            stats.addDocsIndexed(block.size());
+            return new WriteResult.Success(1L, 1L, parentDocId);
         }, stats::addIndexTimeMillis);
     }
 
@@ -256,20 +345,30 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
         if (state != WriterState.PENDING_ROLLBACK && state != WriterState.ACTIVE) {
             throw new IllegalStateException("rollbackTo requires ACTIVE or PENDING_ROLLBACK state but was " + state);
         }
-        if (rowCount > docCount) {
-            throw new IllegalStateException("Cannot rollback to " + rowCount + ": only " + docCount + " docs admitted");
+        if (rowCount > logicalRows) {
+            throw new IllegalStateException("Cannot rollback to " + rowCount + ": only " + logicalRows + " logical rows admitted");
         }
-        if (rowCount == docCount) {
+        if (rowCount == logicalRows) {
             state = WriterState.RETIRED_FLUSHABLE;
             return;
         }
-        if (docCount - rowCount != 1) {
+        if (logicalRows - rowCount != 1) {
             throw new IllegalStateException(
-                "rollbackTo supports rolling back exactly 1 doc, but asked to roll back " + (docCount - rowCount)
+                "rollbackTo supports rolling back exactly 1 logical doc, but asked to roll back " + (logicalRows - rowCount)
             );
         }
-        indexWriter.deleteDocuments(NumericDocValuesField.newSlowExactQuery(DocumentInput.ROW_ID_FIELD, rowCount));
-        docCount = rowCount;
+        if (nestedBlocks) {
+            // Purge the whole block: its docs carry the last `lastBlockDocCount` sequential
+            // row ids, [docCount - lastBlockDocCount, docCount). Sequential ids make the
+            // block addressable by a plain range — children included, no orphans.
+            indexWriter.deleteDocuments(
+                SortedNumericDocValuesField.newSlowRangeQuery(DocumentInput.ROW_ID_FIELD, docCount - lastBlockDocCount, docCount - 1)
+            );
+        } else {
+            indexWriter.deleteDocuments(NumericDocValuesField.newSlowExactQuery(DocumentInput.ROW_ID_FIELD, rowCount));
+        }
+        logicalRows = rowCount;
+        docCount -= lastBlockDocCount;
         state = WriterState.RETIRED_FLUSHABLE;
     }
 
@@ -315,6 +414,17 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
 
             // If sort permutation is provided, configure the reorder merge policy
             if (flushInput.hasRowIdMapping()) {
+                if (nestedBlocks) {
+                    // TODO(nested): sorted flush reorders docs one-row-id-per-doc, which
+                    // would scatter blocks. Vanilla OpenSearch forbids index sorting on
+                    // nested indices; the composite path inherits that restriction until
+                    // block-aware reordering (whole-block sort) is implemented.
+                    throw new IllegalStateException(
+                        "Sorted flush (row-id mapping) is not supported for indices with nested mappings, writer generation ["
+                            + writerGeneration
+                            + "]"
+                    );
+                }
                 // RowIdMapping shouldn't be available if index has sort configurations.
                 Sort configuredIndexSort = indexWriter.getConfig().getIndexSort();
                 if (configuredIndexSort != null) {
@@ -392,25 +502,51 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
             // - Lucene secondary: docs reordered via OneMerge.reorder() + row ID rewrite
             // - Lucene primary with IndexSort: Lucene sorts natively + row ID rewrite
             // - No sort: docs added sequentially, row IDs naturally sequential
+            // - Nested blocks (Scheme C): children and roots alike carry sequential
+            // docId-space ids (I1 holds literally), so the same check applies.
             // Wrapped in `assert` so the I/O cost is paid only when assertions are enabled.
-            assert assertRowIdsSequential(directory) : "___row_id__ doc values not sequential after forceMerge for writer generation ["
+            assert assertRowIdsSequential(directory) : "___row_id__ doc values invariant violated after forceMerge for writer generation ["
                 + writerGeneration
                 + "]";
+            // Nested mode: additionally verify the block accounting — the number of parent
+            // (root) docs must equal logicalRows, which is what Parquet reports as its row
+            // count for this generation. This is the strongest flush-time cross-format check
+            // available under the derivational scheme: per-child correspondence is positional
+            // and only re-derivable, not independently verifiable.
+            assert nestedBlocks == false || assertNestedBlockStructure(directory)
+                : "nested block structure invariant violated for writer generation [" + writerGeneration + "]";
 
             // Stamp the IndexSort on the segment metadata post-commit so that
             // addIndexes(Directory...) on the shared writer sees matching sort.
             // The segment is always sorted by __row_id__ — either naturally (docs
             // written sequentially) or via OneMerge.reorder() + row ID rewrite.
-            if (flushInput.hasRowIdMapping()) {
+            // Composite (nested) mode is sorted by construction too: composite keys
+            // ascend strictly in insertion order (blocks by logical row, children by
+            // ordinal, parent sentinel last), so the declaration is truthful — and
+            // required, or the sorted committer rejects the segment at addIndexes.
+            if (flushInput.hasRowIdMapping() || nestedBlocks) {
                 logger.debug("Overriding segment info manually");
+                if (nestedBlocks) {
+                    // Mark the segment as (potentially) carrying nested blocks BEFORE the
+                    // sort rewrite: rewriteSegmentInfoWithSort copies getAttributes() into
+                    // the rewritten .si, persisting the marker. The merge path reads it to
+                    // decide between plain per-doc remapping and block-aware expansion of
+                    // the logical-row mapping.
+                    segmentInfo.info.putAttribute(NESTED_BLOCKS_ATTRIBUTE, "true");
+                }
                 rewriteSegmentInfoWithSort(segmentInfos, segmentInfo);
             }
 
-            // Build the WriterFileSet pointing to the temp directory
+            // Build the WriterFileSet pointing to the temp directory.
+            // numRows is the cross-format row count and therefore counts LOGICAL rows —
+            // the same number Parquet reports for this generation — not physical Lucene
+            // docs. In plain mode logicalRows == docCount, so this is behavior-neutral;
+            // in composite (nested) mode it is what keeps the engine's cross-format
+            // row-parity assertions correct (1 logical doc == 1 Parquet row == 1 block).
             WriterFileSet.Builder wfsBuilder = WriterFileSet.builder()
                 .directory(tempDirectory)
                 .writerGeneration(writerGeneration)
-                .addNumRows(docCount);
+                .addNumRows(logicalRows);
 
             // Add all files in the segment
             for (String file : directory.listAll()) {
@@ -509,6 +645,61 @@ public class LuceneWriter implements Writer<LuceneDocumentInput> {
         } catch (IOException e) {
             throw new AssertionError("Failed to verify ___row_id__ invariant for writer generation [" + writerGeneration + "]", e);
         }
+    }
+
+    /**
+     * Nested-mode structural check complementing {@link #assertRowIdsSequential}: the
+     * number of parent (root) documents in the segment must equal {@code logicalRows} —
+     * the same number Parquet reports as its row count for this generation. Parents are
+     * identified by complement: child docs carry {@code _nested_path}, roots do not.
+     *
+     * <p>Under the derivational scheme (sequential row ids), per-child correspondence with
+     * Parquet list positions is positional and can only be re-derived, not independently
+     * verified; this count check is the strongest flush-time cross-format invariant
+     * available.
+     */
+    private boolean assertNestedBlockStructure(Directory directory) {
+        try (DirectoryReader reader = DirectoryReader.open(directory)) {
+            assert reader.leaves().size() == 1 : "Expected exactly 1 leaf reader, got " + reader.leaves().size();
+            LeafReader leaf = reader.leaves().get(0).reader();
+            long childDocs = countNestedChildDocs(leaf);
+            long parentDocs = leaf.maxDoc() - childDocs;
+            if (parentDocs != logicalRows) {
+                throw new AssertionError(
+                    "Parent (root) doc count ["
+                        + parentDocs
+                        + "] does not equal logical row count ["
+                        + logicalRows
+                        + "] for writer generation ["
+                        + writerGeneration
+                        + "] — cross-format row parity with Parquet would be broken"
+                );
+            }
+            return true;
+        } catch (IOException e) {
+            throw new AssertionError("Failed to verify nested block structure for writer generation [" + writerGeneration + "]", e);
+        }
+    }
+
+    /**
+     * Counts child documents in the leaf: the union of postings across all terms of the
+     * {@code _nested_path} field. Each child doc carries exactly one nested path term, so
+     * summing per-term docFreq over a deletion-free, freshly force-merged segment counts
+     * each child exactly once. Package-private: the refresh path
+     * ({@link LuceneIndexingExecutionEngine}) uses it to report LOGICAL rows (parents)
+     * for nested-blocks segments after {@code addIndexes}.
+     */
+    static long countNestedChildDocs(LeafReader leaf) throws IOException {
+        Terms terms = leaf.terms(NestedPathFieldMapper.NAME);
+        if (terms == null) {
+            return 0;
+        }
+        long count = 0;
+        TermsEnum termsEnum = terms.iterator();
+        while (termsEnum.next() != null) {
+            count += termsEnum.docFreq();
+        }
+        return count;
     }
 
     /**

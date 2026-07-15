@@ -384,6 +384,12 @@ public class LuceneCommitter extends SafeBootstrapCommitter {
 
         if (isSecondary) {
             iwc.setIndexSort(new Sort(new SortedNumericSortField(DocumentInput.ROW_ID_FIELD, SortField.Type.LONG)));
+            // Must match the parent field on the ingest writer (LuceneWriter) so nested
+            // block segments can be addIndexes'd here, and so this writer's sorted merges
+            // move blocks atomically (Lucene requires a parent field to combine index
+            // sorting with document blocks). Harmless for indices without nested docs —
+            // the field only materializes when blocks are written.
+            iwc.setParentField(LuceneWriter.NESTED_PARENT_FIELD);
         } else if (userProvidedSort != null) {
             iwc.setIndexSort(userProvidedSort);
         }

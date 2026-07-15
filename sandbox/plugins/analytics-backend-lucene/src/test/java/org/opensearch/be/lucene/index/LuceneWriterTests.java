@@ -97,6 +97,188 @@ public class LuceneWriterTests extends LucenePluginBaseTests {
         }
     }
 
+    /**
+     * End-to-end nested block write: a nested-blocks writer ingests a two-comment
+     * document plus a childless document, flushes, and the segment must show the
+     * block-join layout — children before parent — with plain sequential row ids
+     * ({@code __row_id__ == docId}, invariant I1) on every physical doc, children included.
+     */
+    public void testNestedBlockWriteAndFlush() throws IOException {
+        Path baseDir = createTempDir();
+        MappedFieldType author = mockKeywordField("comments.author");
+        MappedFieldType title = mockKeywordField("title");
+        try (
+            LuceneWriter writer = new LuceneWriter(
+                1L,
+                0L,
+                dataFormat,
+                baseDir,
+                null,
+                Codec.getDefault(),
+                null,
+                ConcurrentHashMap.newKeySet(),
+                new LuceneShardStatsTracker(),
+                true // nested-blocks mode
+            )
+        ) {
+            // Logical doc 0: two comments → block of 3.
+            LuceneDocumentInput nested = new LuceneDocumentInput(new org.opensearch.be.lucene.LuceneFieldFactoryRegistry(), true);
+            nested.addField(title, "First post");
+            nested.beginChild("comments");
+            nested.addField(author, "alice");
+            nested.endChild();
+            nested.beginChild("comments");
+            nested.addField(author, "dave");
+            nested.endChild();
+            nested.setRowId(LuceneDocumentInput.ROW_ID_FIELD, 0L);
+            WriteResult first = writer.addDoc(nested);
+            assertTrue(first instanceof WriteResult.Success);
+            // The block's identity is the parent docId — last of the 3 consumed.
+            assertThat(((WriteResult.Success) first).seqNo(), equalTo(2L));
+
+            // Logical doc 1: childless → block of 1.
+            LuceneDocumentInput flat = new LuceneDocumentInput(new org.opensearch.be.lucene.LuceneFieldFactoryRegistry(), true);
+            flat.addField(title, "Second post");
+            flat.setRowId(LuceneDocumentInput.ROW_ID_FIELD, 1L);
+            assertTrue(writer.addDoc(flat) instanceof WriteResult.Success);
+
+            FileInfos fileInfos = writer.flush(FlushInput.EMPTY);
+            WriterFileSet wfs = fileInfos.getWriterFileSet(dataFormat).get();
+            // numRows is the cross-format LOGICAL row count (2 documents), matching what
+            // Parquet reports for the same generation — not the 4 physical Lucene docs.
+            assertThat(wfs.numRows(), equalTo(2L));
+
+            try (NIOFSDirectory dir = new NIOFSDirectory(Path.of(wfs.directory())); IndexReader reader = DirectoryReader.open(dir)) {
+                assertThat(reader.numDocs(), equalTo(4));
+                LeafReader leaf = reader.leaves().get(0).reader();
+                SortedNumericDocValues rowIds = leaf.getSortedNumericDocValues(LuceneDocumentInput.ROW_ID_FIELD);
+
+                // Scheme C: every physical doc — alice, dave, doc-0 parent, childless doc-1 —
+                // carries __row_id__ == docId. Block↔row correspondence is positional
+                // (Kth parent == Kth Parquet row), not encoded in the values.
+                for (int docId = 0; docId < 4; docId++) {
+                    assertTrue(rowIds.advanceExact(docId));
+                    assertThat("sequential row id at docId " + docId, rowIds.nextValue(), equalTo((long) docId));
+                }
+
+                // Children are addressable by nested path; parents are not.
+                IndexSearcher searcher = new IndexSearcher(reader);
+                assertThat(
+                    searcher.count(new TermQuery(new Term(org.opensearch.index.mapper.NestedPathFieldMapper.NAME, "comments"))),
+                    equalTo(2)
+                );
+            }
+        }
+    }
+
+    /**
+     * Refresh-path simulation: two nested generations flushed by composite-mode writers,
+     * incorporated via {@code addIndexes} into a committer-like shared writer (index sort
+     * on the row-id key + the nested parent field), then force-merged. Blocks must remain
+     * contiguous with children before parents, in global logical-row order — the property
+     * every block-join query depends on after refresh and merge.
+     */
+    public void testNestedBlocksSurviveAddIndexesAndSortedMerge() throws IOException {
+        MappedFieldType author = mockKeywordField("comments.author");
+        MappedFieldType title = mockKeywordField("title");
+
+        java.util.List<Path> segmentDirs = new java.util.ArrayList<>();
+
+        // Segment 1 — produced by the real composite-mode LuceneWriter (logical row 0,
+        // two comments). Proves flushed segments are addIndexes-compatible with a
+        // parent-field committer (the parent field lands in this segment's FieldInfos).
+        try (
+            LuceneWriter writer = new LuceneWriter(
+                1L,
+                0L,
+                dataFormat,
+                createTempDir(),
+                null,
+                Codec.getDefault(),
+                null,
+                ConcurrentHashMap.newKeySet(),
+                new LuceneShardStatsTracker(),
+                true
+            )
+        ) {
+            LuceneDocumentInput input = new LuceneDocumentInput(new org.opensearch.be.lucene.LuceneFieldFactoryRegistry(), true);
+            input.addField(title, "post-0");
+            for (String a : new String[] { "alice", "dave" }) {
+                input.beginChild("comments");
+                input.addField(author, a);
+                input.endChild();
+            }
+            input.setRowId(LuceneDocumentInput.ROW_ID_FIELD, 0L);
+            assertTrue(writer.addDoc(input) instanceof WriteResult.Success);
+            WriterFileSet wfs = writer.flush(FlushInput.EMPTY).getWriterFileSet(dataFormat).get();
+            segmentDirs.add(Path.of(wfs.directory()));
+        }
+
+        // Segment 2 — a post-remap-shaped segment (global logical row 1, one comment),
+        // written directly with the same parent-field config. Simulates the state the
+        // remapping merge produces: global sequential row ids continuing after gen1's
+        // 3 docs (ids 3 and 4), block layout, parent field present.
+        Path seg2Dir = createTempDir();
+        try (NIOFSDirectory dir2 = new NIOFSDirectory(seg2Dir)) {
+            org.apache.lucene.index.IndexWriterConfig rawIwc = new org.apache.lucene.index.IndexWriterConfig();
+            rawIwc.setParentField(LuceneWriter.NESTED_PARENT_FIELD);
+            rawIwc.setIndexSort(
+                new org.apache.lucene.search.Sort(
+                    new org.apache.lucene.search.SortedNumericSortField(
+                        LuceneDocumentInput.ROW_ID_FIELD,
+                        org.apache.lucene.search.SortField.Type.LONG
+                    )
+                )
+            );
+            try (org.apache.lucene.index.IndexWriter rawWriter = new org.apache.lucene.index.IndexWriter(dir2, rawIwc)) {
+                org.apache.lucene.document.Document child = new org.apache.lucene.document.Document();
+                child.add(new org.apache.lucene.document.StringField("comments.author", "eve", org.apache.lucene.document.Field.Store.NO));
+                child.add(new org.apache.lucene.document.SortedNumericDocValuesField(LuceneDocumentInput.ROW_ID_FIELD, 3L));
+                org.apache.lucene.document.Document root = new org.apache.lucene.document.Document();
+                root.add(new org.apache.lucene.document.StringField("title", "post-1", org.apache.lucene.document.Field.Store.NO));
+                root.add(new org.apache.lucene.document.SortedNumericDocValuesField(LuceneDocumentInput.ROW_ID_FIELD, 4L));
+                rawWriter.addDocuments(java.util.List.of(child, root));
+                rawWriter.commit();
+            }
+        }
+        segmentDirs.add(seg2Dir);
+
+        // Committer-like shared writer: index sort on the row id + parent field.
+        Path sharedDir = createTempDir();
+        org.apache.lucene.index.IndexWriterConfig iwc = new org.apache.lucene.index.IndexWriterConfig();
+        iwc.setIndexSort(
+            new org.apache.lucene.search.Sort(
+                new org.apache.lucene.search.SortedNumericSortField(
+                    LuceneDocumentInput.ROW_ID_FIELD,
+                    org.apache.lucene.search.SortField.Type.LONG
+                )
+            )
+        );
+        iwc.setParentField(LuceneWriter.NESTED_PARENT_FIELD);
+        try (NIOFSDirectory shared = new NIOFSDirectory(sharedDir)) {
+            try (org.apache.lucene.index.IndexWriter sharedWriter = new org.apache.lucene.index.IndexWriter(shared, iwc)) {
+                // Incorporate gen segments in REVERSE order so the sorted merge has real
+                // reordering work (gen2's block must sort after gen1's despite arriving first).
+                sharedWriter.addIndexes(new NIOFSDirectory(segmentDirs.get(1)), new NIOFSDirectory(segmentDirs.get(0)));
+                sharedWriter.forceMerge(1);
+                sharedWriter.commit();
+            }
+
+            try (IndexReader reader = DirectoryReader.open(shared)) {
+                assertThat(reader.numDocs(), equalTo(5)); // (2 children + parent) + (1 child + parent)
+                LeafReader leaf = reader.leaves().get(0).reader();
+                SortedNumericDocValues keys = leaf.getSortedNumericDocValues(LuceneDocumentInput.ROW_ID_FIELD);
+
+                // Expected order: gen1's block [alice=0, dave=1, parent=2] then gen2's block
+                // [eve=3, parent=4] — sequential row ids equal final docIds (I1 restored).
+                for (int docId = 0; docId < 5; docId++) {
+                    assertTrue(keys.advanceExact(docId));
+                    assertThat("block layout at docId " + docId, keys.nextValue(), equalTo((long) docId));
+                }
+            }
+        }
+    }
+
     public void testRowIdMatchesLuceneDocId() throws IOException {
         Path baseDir = createTempDir();
         int numDocs = randomIntBetween(10, 50);
@@ -244,7 +426,7 @@ public class LuceneWriterTests extends LucenePluginBaseTests {
             // Should not throw — unsupported types are silently skipped (handled by other formats)
             input.addField(numericField, 42);
             // The document should have no fields for the unsupported type
-            assertEquals(0, input.getFinalInput().getFields().size());
+            assertEquals(0, input.getFinalInput().get(0).getFields().size());
         }
     }
 
@@ -278,7 +460,7 @@ public class LuceneWriterTests extends LucenePluginBaseTests {
         ) {
             LuceneDocumentInput input = new LuceneDocumentInput();
             input.addField(fieldOwnedByOther, 42);
-            assertEquals(0, input.getFinalInput().getFields().size());
+            assertEquals(0, input.getFinalInput().get(0).getFields().size());
         }
     }
 

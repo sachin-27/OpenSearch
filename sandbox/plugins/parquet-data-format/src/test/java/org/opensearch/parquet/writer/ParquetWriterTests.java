@@ -209,4 +209,91 @@ public class ParquetWriterTests extends ParquetBaseTests {
         fields.addAll(metadataFields());
         return new Schema(fields);
     }
+
+    /**
+     * End-to-end nested round trip through the native Rust writer: a two-comment doc plus
+     * a flat doc flushed to a real Parquet file, read back and verified structurally —
+     * proving LIST&lt;STRUCT&gt; vectors survive the Arrow C Data export and Dremel encoding.
+     */
+    public void testNestedListStructRoundTrip() throws Exception {
+        // Schema: title (flat keyword) + comments: LIST<STRUCT<author, score>> + metadata.
+        MappedFieldType titleField = new KeywordFieldMapper.KeywordFieldType("title");
+        MappedFieldType authorField = new KeywordFieldMapper.KeywordFieldType("comments.author");
+        MappedFieldType commentScoreField = new NumberFieldMapper.NumberFieldType("comments.score", NumberFieldMapper.NumberType.INTEGER);
+        assignTestCapabilities(titleField, parquetFormat);
+        assignTestCapabilities(authorField, parquetFormat);
+        assignTestCapabilities(commentScoreField, parquetFormat);
+
+        ParquetField keywordPf = ArrowFieldRegistry.getParquetField("keyword");
+        ParquetField intPf = ArrowFieldRegistry.getParquetField("integer");
+        Field author = new Field("author", keywordPf.getFieldType(), null);
+        Field score = new Field("score", intPf.getFieldType(), null);
+        Field element = new Field(
+            "element",
+            org.apache.arrow.vector.types.pojo.FieldType.nullable(org.apache.arrow.vector.types.pojo.ArrowType.Struct.INSTANCE),
+            List.of(author, score)
+        );
+        Field comments = new Field(
+            "comments",
+            org.apache.arrow.vector.types.pojo.FieldType.nullable(new org.apache.arrow.vector.types.pojo.ArrowType.List()),
+            List.of(element)
+        );
+        List<Field> fields = new ArrayList<>();
+        fields.add(new Field("title", keywordPf.getFieldType(), null));
+        fields.add(comments);
+        fields.addAll(metadataFields());
+        Schema nestedSchema = new Schema(fields);
+
+        String filePath = createTempDir().resolve("nested.parquet").toString();
+        ParquetWriter writer = new ParquetWriter(
+            filePath,
+            1L,
+            1L,
+            new ParquetDataFormat(),
+            nestedSchema,
+            () -> nestedSchema,
+            bufferPool,
+            indexSettings,
+            threadPool,
+            null
+        );
+
+        // Doc 0: two comments (dave has no score). Doc 1: flat, no comments.
+        ParquetDocumentInput nestedDoc = new ParquetDocumentInput();
+        populateMetadataFields(nestedDoc);
+        nestedDoc.addField(titleField, "First post");
+        nestedDoc.beginChild("comments");
+        nestedDoc.addField(authorField, "alice");
+        nestedDoc.addField(commentScoreField, 5);
+        nestedDoc.endChild();
+        nestedDoc.beginChild("comments");
+        nestedDoc.addField(authorField, "dave");
+        nestedDoc.endChild();
+        nestedDoc.setRowId(DocumentInput.ROW_ID_FIELD, 0);
+        assertTrue(writer.addDoc(nestedDoc) instanceof WriteResult.Success);
+        nestedDoc.close();
+
+        ParquetDocumentInput flatDoc = new ParquetDocumentInput();
+        populateMetadataFields(flatDoc);
+        flatDoc.addField(titleField, "Second post");
+        flatDoc.setRowId(DocumentInput.ROW_ID_FIELD, 1);
+        assertTrue(writer.addDoc(flatDoc) instanceof WriteResult.Success);
+        flatDoc.close();
+
+        writer.flush(FlushInput.EMPTY);
+        assertEquals(2, RustBridge.getFileMetadata(filePath).numRows());
+
+        // Read the file back through the native debug reader. Its JSON serializer cannot
+        // render list values (prints "<unsupported:List(...)>"), so element-level values
+        // are verified at the vector layer (NestedVectorWriterTests); here we verify the
+        // file-level structure: the LIST<STRUCT> column round-tripped with the right
+        // shape, the nested row holds a NON-NULL list, and the flat row holds null.
+        String json = RustBridge.readAsJson(filePath);
+        assertTrue("both rows present: " + json, json.contains("First post") && json.contains("Second post"));
+        // Row 0's comments value is non-null and typed LIST<STRUCT<author: Utf8, score: Int32>>.
+        assertTrue("row 0 comments must be a present list value: " + json, json.contains("List(Struct("));
+        assertTrue("struct children must round-trip: " + json, json.contains("author") && json.contains("score"));
+        // Row 1 (flat doc) must have a null comments column, not an empty list.
+        assertTrue("flat row must have null comments: " + json, json.contains("\"comments\":null"));
+    }
 }

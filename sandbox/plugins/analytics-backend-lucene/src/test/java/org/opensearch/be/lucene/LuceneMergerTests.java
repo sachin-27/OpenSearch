@@ -38,6 +38,8 @@ import org.opensearch.index.engine.dataformat.MergeResult;
 import org.opensearch.index.engine.dataformat.PackedRowIdMapping;
 import org.opensearch.index.engine.dataformat.RowIdMapping;
 import org.opensearch.index.engine.exec.Segment;
+import org.opensearch.index.engine.exec.WriterFileSet;
+import org.opensearch.index.mapper.NestedPathFieldMapper;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -46,6 +48,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
+import static org.opensearch.be.lucene.index.LuceneWriter.NESTED_BLOCKS_ATTRIBUTE;
+import static org.opensearch.be.lucene.index.LuceneWriter.NESTED_PARENT_FIELD;
 import static org.opensearch.be.lucene.index.LuceneWriter.WRITER_GENERATION_ATTRIBUTE;
 
 /**
@@ -318,6 +322,150 @@ public class LuceneMergerTests extends OpenSearchTestCase {
         iwc.setMergePolicy(NoMergePolicy.INSTANCE);
         iwc.setIndexSort(new Sort(new SortedNumericSortField(ROW_ID_FIELD, SortField.Type.LONG)));
         writer = new MergeIndexWriter(directory, iwc);
+    }
+
+    /**
+     * End-to-end merge of nested-blocks segments under Scheme C (sequential row ids):
+     * verifies that the merge recovers each source segment's block structure from
+     * {@code _nested_path}, expands the primary's logical-row mapping into final
+     * per-doc positions, that the index sort lays merged blocks out contiguously
+     * (children first, parent last), that stored fields follow their documents, that
+     * the merged segment's row ids come out sequential 0..maxDoc-1 (I1 restored), that
+     * the merged segment inherits the {@code nested_blocks} attribute, and that the
+     * merged file set reports LOGICAL rows (one per block), not physical docs.
+     *
+     * <p>Sources (both with {@code __row_id__ == docId}):
+     * <ul>
+     *   <li>gen=1: one block (2 children + parent, logical row 0) + one childless
+     *       parent (logical row 1) — 4 physical docs, 2 logical rows</li>
+     *   <li>gen=2: one block (1 child + parent, logical row 0) — 2 physical docs, 1 logical row</li>
+     * </ul>
+     *
+     * <p>Interleaving logical mapping: gen1 {0→0, 1→2}, gen2 {0→1}. Block sizes by new
+     * logical row: {0:3, 1:2, 2:1} → block starts {0, 3, 5}. Expected merged doc order:
+     * [g1b_c0, g1b_c1, g1b_p, g2b_c0, g2b_p, g1_p1] with row ids [0..5] — the gen2
+     * block lands between gen1's block and gen1's childless parent.
+     */
+    public void testMergeExpandsLogicalMappingAndPreservesBlocks() throws IOException {
+        // The shared harness writer has no parent field configured; nested blocks + index
+        // sort require IndexWriterConfig#setParentField, so this test uses its own writer.
+        Path nestedPath = createTempDir();
+        try (Directory nestedDir = NIOFSDirectory.open(nestedPath)) {
+            IndexWriterConfig iwc = new IndexWriterConfig(new MockAnalyzer(random()));
+            iwc.setMergeScheduler(new SerialMergeScheduler());
+            iwc.setMergePolicy(NoMergePolicy.INSTANCE);
+            iwc.setIndexSort(new Sort(new SortedNumericSortField(ROW_ID_FIELD, SortField.Type.LONG)));
+            iwc.setParentField(NESTED_PARENT_FIELD);
+            try (MergeIndexWriter nestedWriter = new MergeIndexWriter(nestedDir, iwc)) {
+                // gen=1: block [g1b_c0=0, g1b_c1=1, g1b_p=2] + childless g1_p1=3.
+                // Sequential ids (== docId); children marked by _nested_path, which is how
+                // the merge recovers the block structure.
+                List<Document> gen1Block = new ArrayList<>();
+                gen1Block.add(childDoc("g1b_c0", 0));
+                gen1Block.add(childDoc("g1b_c1", 1));
+                gen1Block.add(parentDoc("g1b_p", 2));
+                nestedWriter.addDocuments(gen1Block);
+                nestedWriter.addDocument(parentDoc("g1_p1", 3));
+                nestedWriter.flush();
+                stampLatestSegment(nestedWriter, 1L);
+
+                // gen=2: block [g2b_c0=0, g2b_p=1]
+                List<Document> gen2Block = new ArrayList<>();
+                gen2Block.add(childDoc("g2b_c0", 0));
+                gen2Block.add(parentDoc("g2b_p", 1));
+                nestedWriter.addDocuments(gen2Block);
+                nestedWriter.flush();
+                stampLatestSegment(nestedWriter, 2L);
+
+                nestedWriter.commit();
+
+                // Logical-row mapping (children never appear): gen1 {0→0, 1→2}, gen2 {0→1}
+                long[] mappingArray = new long[] { 0, 2, 1 };
+                Map<Long, Integer> genOffsets = Map.of(1L, 0, 2L, 2);
+                Map<Long, Integer> genSizes = Map.of(1L, 2, 2L, 1);
+                RowIdMapping rowIdMapping = new PackedRowIdMapping(mappingArray, genOffsets, genSizes);
+
+                LuceneMerger merger = new LuceneMerger(nestedWriter, new LuceneDataFormat(), nestedPath, new LuceneShardStatsTracker());
+                List<Segment> segments = buildSegments(getSegmentInfos(nestedWriter));
+                MergeInput input = MergeInput.builder().segments(segments).rowIdMapping(rowIdMapping).newWriterGeneration(10L).build();
+
+                MergeResult result = merger.merge(input);
+
+                // The merged file set must report LOGICAL rows (3 blocks), not physical docs (6).
+                WriterFileSet mergedFileSet = result.getMergedWriterFileSet().values().iterator().next();
+                assertEquals("Merged file set must count logical rows, not physical docs", 3L, mergedFileSet.numRows());
+
+                // The merged segment must inherit the nested-blocks marker for future merges.
+                SegmentCommitInfo merged = findSegmentWithGeneration(getSegmentInfos(nestedWriter), 10L);
+                assertNotNull("Merged segment must carry writer_generation=10", merged);
+                assertEquals(
+                    "Merged segment must inherit the nested_blocks attribute",
+                    "true",
+                    merged.info.getAttribute(NESTED_BLOCKS_ATTRIBUTE)
+                );
+
+                nestedWriter.commit();
+
+                // Expected doc order after block-aware expansion + index sort; row ids come
+                // out sequential 0..5 == final docIds (I1 restored in the merged segment).
+                String[] expectedIds = { "g1b_c0", "g1b_c1", "g1b_p", "g2b_c0", "g2b_p", "g1_p1" };
+                long[] expectedKeys = { 0, 1, 2, 3, 4, 5 };
+
+                try (DirectoryReader reader = DirectoryReader.open(nestedWriter)) {
+                    LeafReaderContext mergedLeaf = null;
+                    for (LeafReaderContext ctx : reader.leaves()) {
+                        if (mergedLeaf == null || ctx.reader().maxDoc() > mergedLeaf.reader().maxDoc()) {
+                            mergedLeaf = ctx;
+                        }
+                    }
+                    assertNotNull("Should have at least one leaf", mergedLeaf);
+                    assertEquals("Merged segment should have 6 physical docs", 6, mergedLeaf.reader().maxDoc());
+
+                    SortedNumericDocValues rowIdDV = mergedLeaf.reader().getSortedNumericDocValues(ROW_ID_FIELD);
+                    assertNotNull(ROW_ID_FIELD + " doc values should exist", rowIdDV);
+
+                    for (int i = 0; i < expectedIds.length; i++) {
+                        assertTrue("Should have doc values for doc " + i, rowIdDV.advanceExact(i));
+                        assertEquals("Sequential row id at position " + i, expectedKeys[i], rowIdDV.nextValue());
+                        Document doc = mergedLeaf.reader().storedFields().document(i);
+                        assertEquals("Stored doc at position " + i, expectedIds[i], doc.get("id"));
+                    }
+                }
+            }
+        }
+    }
+
+    /** A nested child doc: sequential row id + {@code _nested_path} (how the merge identifies children). */
+    private Document childDoc(String id, long sequentialRowId) {
+        Document doc = parentDoc(id, sequentialRowId);
+        doc.add(new StringField(NestedPathFieldMapper.NAME, "comments", Field.Store.NO));
+        return doc;
+    }
+
+    /** A parent (root) doc: sequential row id, no {@code _nested_path}. */
+    private Document parentDoc(String id, long sequentialRowId) {
+        Document doc = new Document();
+        doc.add(new StringField("id", id, Field.Store.YES));
+        doc.add(new SortedNumericDocValuesField(ROW_ID_FIELD, sequentialRowId));
+        return doc;
+    }
+
+    /**
+     * Stamps both the writer-generation and nested-blocks attributes on the newest
+     * segment, mimicking what {@code LuceneWriter#flush} does for nested-index segments.
+     */
+    @SuppressForbidden(reason = "Need reflection to stamp segment attributes for testing")
+    private void stampLatestSegment(IndexWriter w, long generation) throws IOException {
+        setWriterGenerationOnLatestSegment(w, generation);
+        try {
+            java.lang.reflect.Field segInfosField = IndexWriter.class.getDeclaredField("segmentInfos");
+            segInfosField.setAccessible(true);
+            SegmentInfos segInfos = (SegmentInfos) segInfosField.get(w);
+            SegmentCommitInfo lastSegment = segInfos.asList().get(segInfos.size() - 1);
+            lastSegment.info.putAttribute(NESTED_BLOCKS_ATTRIBUTE, "true");
+        } catch (ReflectiveOperationException e) {
+            throw new IOException("Failed to set nested_blocks attribute via reflection", e);
+        }
     }
 
     private SegmentCommitInfo findSegmentWithGeneration(SegmentInfos infos, long generation) {

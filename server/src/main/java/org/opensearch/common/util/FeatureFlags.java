@@ -85,6 +85,20 @@ public class FeatureFlags {
         Property.NodeScope
     );
 
+    /**
+     * Gates {@code nested} field type support for pluggable dataformat (composite engine) indices.
+     * While the nested document support is under development, mappings with {@code "type": "nested"}
+     * are rejected on composite indices unless this flag is enabled. Has no effect when
+     * {@link #PLUGGABLE_DATAFORMAT_EXPERIMENTAL_FLAG} is disabled.
+     */
+    public static final String PLUGGABLE_DATAFORMAT_NESTED_EXPERIMENTAL_FLAG = FEATURE_FLAG_PREFIX + "pluggable.dataformat.nested.enabled";
+
+    public static final Setting<Boolean> PLUGGABLE_DATAFORMAT_NESTED_EXPERIMENTAL_SETTING = Setting.boolSetting(
+        PLUGGABLE_DATAFORMAT_NESTED_EXPERIMENTAL_FLAG,
+        false,
+        Property.NodeScope
+    );
+
     public static final Setting<Boolean> CONTEXT_AWARE_MIGRATION_EXPERIMENTAL_SETTING = Setting.boolSetting(
         CONTEXT_AWARE_MIGRATION_EXPERIMENTAL_FLAG,
         false,
@@ -153,6 +167,10 @@ public class FeatureFlags {
                 put(STREAM_TRANSPORT_SETTING, STREAM_TRANSPORT_SETTING.getDefault(Settings.EMPTY));
                 put(CONTEXT_AWARE_MIGRATION_EXPERIMENTAL_SETTING, CONTEXT_AWARE_MIGRATION_EXPERIMENTAL_SETTING.getDefault(Settings.EMPTY));
                 put(PLUGGABLE_DATAFORMAT_EXPERIMENTAL_SETTING, PLUGGABLE_DATAFORMAT_EXPERIMENTAL_SETTING.getDefault(Settings.EMPTY));
+                put(
+                    PLUGGABLE_DATAFORMAT_NESTED_EXPERIMENTAL_SETTING,
+                    PLUGGABLE_DATAFORMAT_NESTED_EXPERIMENTAL_SETTING.getDefault(Settings.EMPTY)
+                );
             }
         };
 

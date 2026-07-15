@@ -36,6 +36,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
+import static org.opensearch.be.lucene.index.LuceneWriter.NESTED_BLOCKS_ATTRIBUTE;
 import static org.opensearch.be.lucene.index.LuceneWriter.WRITER_GENERATION_ATTRIBUTE;
 
 /**
@@ -168,7 +169,7 @@ public class LuceneMerger implements Merger {
 
             // Build the merged WriterFileSet from the output segment info
             SegmentCommitInfo mergedInfo = oneMerge.getMergeInfo();
-            WriterFileSet mergedFileSet = buildMergedFileSet(mergedInfo, mergeInput.newWriterGeneration());
+            WriterFileSet mergedFileSet = buildMergedFileSet(mergedInfo, mergeInput.newWriterGeneration(), rowIdMapping);
 
             // Delegate RowIdMapping production to the strategy
             RowIdMapping outputMapping = strategy.buildRowIdMapping(oneMerge, mergeInput);
@@ -207,12 +208,21 @@ public class LuceneMerger implements Merger {
 
     /**
      * Builds a {@link WriterFileSet} from the merged segment info.
+     *
+     * <p>{@code numRows} is the cross-format LOGICAL row count — the number Parquet
+     * reports for the merged generation. For flat segments this equals {@code maxDoc}.
+     * For nested-blocks segments, physical docs outnumber logical rows (each block is
+     * 1 logical row spanning N+1 docs), so the logical count is the mapping's size:
+     * the primary's merge mapping has exactly one entry per surviving logical row.
      */
-    private WriterFileSet buildMergedFileSet(SegmentCommitInfo mergedInfo, long writerGeneration) throws IOException {
+    private WriterFileSet buildMergedFileSet(SegmentCommitInfo mergedInfo, long writerGeneration, RowIdMapping rowIdMapping)
+        throws IOException {
+        boolean nestedBlocks = Boolean.parseBoolean(mergedInfo.info.getAttribute(NESTED_BLOCKS_ATTRIBUTE));
+        long numRows = nestedBlocks ? rowIdMapping.size() : mergedInfo.info.maxDoc();
         WriterFileSet.Builder builder = WriterFileSet.builder()
             .directory(storeDirectory)
             .writerGeneration(writerGeneration)
-            .addNumRows(mergedInfo.info.maxDoc());
+            .addNumRows(numRows);
         for (String file : mergedInfo.files()) {
             builder.addFile(file);
         }
