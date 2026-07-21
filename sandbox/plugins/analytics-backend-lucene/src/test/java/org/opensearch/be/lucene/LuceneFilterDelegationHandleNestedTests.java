@@ -74,6 +74,11 @@ public class LuceneFilterDelegationHandleNestedTests extends LucenePluginBaseTes
     private NIOFSDirectory directory;
     private DirectoryReader reader;
     private LuceneFilterDelegationHandle handle;
+    private LuceneReader luceneReader;
+    private QueryShardContext context;
+    private NamedWriteableRegistry registry;
+    private List<DelegatedExpression> expressions;
+    private NestedParentLayoutCache sharedCache;
 
     @Override
     public void setUp() throws Exception {
@@ -108,24 +113,37 @@ public class LuceneFilterDelegationHandleNestedTests extends LucenePluginBaseTes
 
         // --- Build the real handle around it ---
         String segmentName = ((SegmentReader) reader.leaves().get(0).reader()).getSegmentInfo().info.name;
-        LuceneReader luceneReader = new LuceneReader(reader, Map.of(1L, segmentName));
+        luceneReader = new LuceneReader(reader, Map.of(1L, segmentName));
 
-        QueryShardContext context = mock(QueryShardContext.class);
+        context = mock(QueryShardContext.class);
         when(context.searcher()).thenReturn(new IndexSearcher(reader));
         when(context.fieldMapper("comments.author")).thenReturn(author);
         when(context.fieldMapper("title")).thenReturn(title);
 
-        NamedWriteableRegistry registry = new NamedWriteableRegistry(
+        registry = new NamedWriteableRegistry(
             List.of(new NamedWriteableRegistry.Entry(QueryBuilder.class, TermQueryBuilder.NAME, TermQueryBuilder::new))
         );
 
-        List<DelegatedExpression> expressions = List.of(
+        expressions = List.of(
             expression(AUTHOR_ALICE, new TermQueryBuilder("comments.author", "alice")),
             expression(TITLE_SECOND, new TermQueryBuilder("title", "Second")),
             expression(AUTHOR_ZOE, new TermQueryBuilder("comments.author", "zoe"))
         );
 
-        handle = new LuceneFilterDelegationHandle(expressions, context, luceneReader, mock(CatalogSnapshot.class), registry, () -> false);
+        sharedCache = new NestedParentLayoutCache();
+        handle = newHandle();
+    }
+
+    private LuceneFilterDelegationHandle newHandle() {
+        return new LuceneFilterDelegationHandle(
+            expressions,
+            context,
+            luceneReader,
+            mock(CatalogSnapshot.class),
+            registry,
+            () -> false,
+            sharedCache
+        );
     }
 
     @Override
@@ -161,6 +179,26 @@ public class LuceneFilterDelegationHandleNestedTests extends LucenePluginBaseTes
     public void testRowSpaceWindow() {
         assertEquals("alice's row 0 outside window [2,4)", 0L, collect(AUTHOR_ALICE, 2, 4)[0]);
         assertEquals("zoe's row 3 at window-relative bit 1", 0b10L, collect(AUTHOR_ZOE, 2, 4)[0]);
+    }
+
+    /**
+     * Production topology: per-query handles share the plugin-owned layout cache. A second
+     * handle must produce identical row bits, served from the single cached layout entry
+     * built by the first handle (same segment core → one entry, before and after).
+     */
+    public void testSharedCacheAcrossHandles() throws Exception {
+        assertEquals("row bits via first handle", 0b0001L, collect(handle, AUTHOR_ALICE, 0, 4)[0]);
+        assertEquals("first handle's collect populated the shared cache", 1, sharedCache.size());
+
+        LuceneFilterDelegationHandle second = newHandle();
+        try {
+            assertEquals("child match via second handle", 0b0001L, collect(second, AUTHOR_ALICE, 0, 4)[0]);
+            assertEquals("root match via second handle", 0b0010L, collect(second, TITLE_SECOND, 0, 4)[0]);
+            assertEquals("distinct-parent via second handle", 0b1000L, collect(second, AUTHOR_ZOE, 0, 4)[0]);
+            assertEquals("same segment core — still exactly one cached layout", 1, sharedCache.size());
+        } finally {
+            second.close();
+        }
     }
 
     /** createCollector must validate bounds against the ROW count (4), not maxDoc (9). */
@@ -205,17 +243,21 @@ public class LuceneFilterDelegationHandleNestedTests extends LucenePluginBaseTes
 
     /** Runs the full provider→collector→collectDocs flow and returns the raw bitset words. */
     private long[] collect(int annotationId, int minRow, int maxRow) {
-        int providerKey = handle.createProvider(annotationId);
+        return collect(handle, annotationId, minRow, maxRow);
+    }
+
+    private long[] collect(LuceneFilterDelegationHandle target, int annotationId, int minRow, int maxRow) {
+        int providerKey = target.createProvider(annotationId);
         assertTrue("provider must be created", providerKey > 0);
-        int collectorKey = handle.createCollector(providerKey, 1L, minRow, maxRow);
+        int collectorKey = target.createCollector(providerKey, 1L, minRow, maxRow);
         assertTrue("collector must be created", collectorKey > 0);
         int span = maxRow - minRow;
         long[] words = new long[(span + 63) >>> 6];
         MemorySegment out = MemorySegment.ofArray(words);
-        int wordCount = handle.collectDocs(collectorKey, minRow, maxRow, out);
+        int wordCount = target.collectDocs(collectorKey, minRow, maxRow, out);
         assertEquals((span + 63) >>> 6, wordCount);
-        handle.releaseCollector(collectorKey);
-        handle.releaseProvider(providerKey);
+        target.releaseCollector(collectorKey);
+        target.releaseProvider(providerKey);
         return words;
     }
 }

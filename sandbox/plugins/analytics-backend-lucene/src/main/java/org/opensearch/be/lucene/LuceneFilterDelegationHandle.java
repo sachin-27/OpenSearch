@@ -72,8 +72,8 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
 
     private final ConcurrentHashMap<Integer, Weight> weightsByProviderKey = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, ScorerHandle> scorersByCollectorKey = new ConcurrentHashMap<>();
-    /** Per-leaf docId↔logical-row translators for nested-blocks segments (null slot = flat leaf). */
-    private final ConcurrentHashMap<Integer, LayoutSlot> layoutsByLeafOrd = new ConcurrentHashMap<>();
+    /** Plugin-owned, segment-lifetime cache of docId↔logical-row translators. */
+    private final NestedParentLayoutCache layoutCache;
     private final AtomicInteger nextProviderKey = new AtomicInteger(1);
     private final AtomicInteger nextCollectorKey = new AtomicInteger(1);
 
@@ -83,7 +83,8 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         LuceneReader luceneReader,
         CatalogSnapshot catalogSnapshot,
         NamedWriteableRegistry namedWriteableRegistry,
-        BooleanSupplier isCancelledSupplier
+        BooleanSupplier isCancelledSupplier,
+        NestedParentLayoutCache layoutCache
     ) {
         assert luceneReader != null : "luceneReader must not be null";
         assert catalogSnapshot != null : "catalogSnapshot must not be null";
@@ -93,6 +94,7 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         this.generationToSegmentName = luceneReader.generationToSegmentName();
         this.queriesByAnnotationId = compileQueries(expressions, queryShardContext, namedWriteableRegistry);
         this.isCancelledSupplier = isCancelledSupplier;
+        this.layoutCache = layoutCache;
     }
 
     private static Map<Integer, Query> compileQueries(
@@ -327,26 +329,12 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
     }
 
     /**
-     * Returns the leaf's docId↔row translator, or null for flat segments. Cached per
-     * leaf ord — the layout is immutable per reader, and building it costs a postings
-     * pass we don't want per collector.
+     * Returns the leaf's docId↔row translator, or null for flat segments. Backed by the
+     * plugin-owned {@link NestedParentLayoutCache}, so layouts are built once per segment
+     * core and shared across queries and reader reopens.
      */
     private NestedParentLayout layoutFor(LeafReaderContext leaf) throws IOException {
-        LayoutSlot slot = layoutsByLeafOrd.get(leaf.ord);
-        if (slot == null) {
-            slot = new LayoutSlot(NestedParentLayout.of(leaf.reader()));
-            layoutsByLeafOrd.putIfAbsent(leaf.ord, slot);
-        }
-        return slot.layout;
-    }
-
-    /** Nullable-value wrapper so flat leaves (layout == null) are cached too. */
-    private static final class LayoutSlot {
-        final NestedParentLayout layout;
-
-        LayoutSlot(NestedParentLayout layout) {
-            this.layout = layout;
-        }
+        return layoutCache.get(leaf.reader());
     }
 
     private static final class ScorerHandle {

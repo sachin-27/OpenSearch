@@ -211,6 +211,13 @@ public class LuceneAnalyticsBackendPlugin implements AnalyticsSearchBackendPlugi
 
     private static final Logger LOGGER = LogManager.getLogger(LuceneAnalyticsBackendPlugin.class);
 
+    /**
+     * Node-lifetime cache of nested docId↔row layouts, shared by all delegation handles.
+     * Entries are keyed by segment core and self-evict when the segment closes, so the
+     * long-lived owner cannot leak (see {@link NestedParentLayoutCache}).
+     */
+    private final NestedParentLayoutCache nestedParentLayoutCache = new NestedParentLayoutCache();
+
     @Override
     public FilterDelegationHandle getFilterDelegationHandle(List<DelegatedExpression> expressions, CommonExecutionContext ctx) {
         ShardScanExecutionContext shardCtx = (ShardScanExecutionContext) ctx;
@@ -230,7 +237,8 @@ public class LuceneAnalyticsBackendPlugin implements AnalyticsSearchBackendPlugi
             luceneReader,
             reader.catalogSnapshot(),
             shardCtx.getNamedWriteableRegistry(),
-            isCancelled
+            isCancelled,
+            nestedParentLayoutCache
         );
     }
 
