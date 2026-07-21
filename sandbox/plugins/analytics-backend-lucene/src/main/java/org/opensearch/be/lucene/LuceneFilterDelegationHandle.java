@@ -72,6 +72,8 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
 
     private final ConcurrentHashMap<Integer, Weight> weightsByProviderKey = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Integer, ScorerHandle> scorersByCollectorKey = new ConcurrentHashMap<>();
+    /** Per-leaf docId↔logical-row translators for nested-blocks segments (null slot = flat leaf). */
+    private final ConcurrentHashMap<Integer, LayoutSlot> layoutsByLeafOrd = new ConcurrentHashMap<>();
     private final AtomicInteger nextProviderKey = new AtomicInteger(1);
     private final AtomicInteger nextCollectorKey = new AtomicInteger(1);
 
@@ -170,8 +172,19 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
             return -1;
         }
 
-        int leafMaxDoc = leaf.reader().maxDoc();
-        assert minDoc >= 0 && minDoc <= maxDoc && maxDoc <= leafMaxDoc : "createCollector(providerKey="
+        // Nested-blocks segments: the caller's [minDoc, maxDoc) window is in LOGICAL ROW
+        // space (DataFusion partitions Parquet rows), not docId space. The layout (null
+        // for flat segments) translates between the two; the address space the bounds
+        // are validated against is rows for nested leaves, docIds for flat ones.
+        NestedParentLayout layout;
+        try {
+            layout = layoutFor(leaf);
+        } catch (IOException exception) {
+            LOGGER.error("createCollector: failed to build nested parent layout for segment " + segName, exception);
+            return -1;
+        }
+        int addressSpace = layout != null ? layout.rowCount() : leaf.reader().maxDoc();
+        assert minDoc >= 0 && minDoc <= maxDoc && maxDoc <= addressSpace : "createCollector(providerKey="
             + providerKey
             + ", writerGeneration="
             + writerGeneration
@@ -181,13 +194,14 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
             + minDoc
             + ","
             + maxDoc
-            + ") exceeds leaf maxDoc="
-            + leafMaxDoc;
+            + ") exceeds address space="
+            + addressSpace
+            + (layout != null ? " (logical rows)" : " (maxDoc)");
 
         try {
             Scorer scorer = weight.scorer(leaf);
             int collectorKey = nextCollectorKey.getAndIncrement();
-            scorersByCollectorKey.put(collectorKey, new ScorerHandle(scorer, minDoc, maxDoc));
+            scorersByCollectorKey.put(collectorKey, new ScorerHandle(scorer, minDoc, maxDoc, layout));
             LOGGER.debug(
                 "[scf] createCollector providerKey={} writerGeneration={} range=[{},{}) → collectorKey={}",
                 providerKey,
@@ -211,6 +225,16 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         return isCancelledSupplier != null && isCancelledSupplier.getAsBoolean();
     }
 
+    /**
+     * Fills a bitset over {@code [minDoc, maxDoc)} with the matches of the collector's
+     * scorer. For flat segments the window and the bits are in docId space (docId ==
+     * Parquet row, invariant I1). For nested-blocks segments the window and the bits are
+     * in LOGICAL ROW space: the scorer still iterates physical docs, but each match —
+     * child or parent alike — is translated to its block's logical row via
+     * {@link NestedParentLayout#rowOf}, so DataFusion always receives Parquet-row bits
+     * and never learns nested blocks exist. Multiple child matches of one block
+     * idempotently set the same bit (distinct-parent semantics).
+     */
     @Override
     public int collectDocs(int collectorKey, int minDoc, int maxDoc, MemorySegment out) {
         ScorerHandle handle = scorersByCollectorKey.get(collectorKey);
@@ -232,12 +256,27 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
                     DocIdSetIterator iterator = handle.scorer.iterator();
                     int docId = handle.currentDoc;
                     if (docId != DocIdSetIterator.NO_MORE_DOCS) {
-                        if (docId < scanFrom) {
-                            docId = iterator.advance(scanFrom);
-                        }
-                        while (docId != DocIdSetIterator.NO_MORE_DOCS && docId < scanTo) {
-                            bits.set(docId - minDoc);
-                            docId = iterator.nextDoc();
+                        if (handle.layout == null) {
+                            // Flat segment: bits and window are docIds.
+                            if (docId < scanFrom) {
+                                docId = iterator.advance(scanFrom);
+                            }
+                            while (docId != DocIdSetIterator.NO_MORE_DOCS && docId < scanTo) {
+                                bits.set(docId - minDoc);
+                                docId = iterator.nextDoc();
+                            }
+                        } else {
+                            // Nested segment: window is rows — select the docId range that
+                            // covers those blocks (first block's start .. last block's parent).
+                            int scanFromDoc = handle.layout.blockStartDocId(scanFrom);
+                            int scanToDoc = handle.layout.parentDocId(scanTo - 1) + 1;
+                            if (docId < scanFromDoc) {
+                                docId = iterator.advance(scanFromDoc);
+                            }
+                            while (docId != DocIdSetIterator.NO_MORE_DOCS && docId < scanToDoc) {
+                                bits.set(handle.layout.rowOf(docId) - minDoc);
+                                docId = iterator.nextDoc();
+                            }
                         }
                         handle.currentDoc = docId;
                     }
@@ -287,16 +326,43 @@ final class LuceneFilterDelegationHandle implements FilterDelegationHandle {
         return (SegmentReader) current;
     }
 
+    /**
+     * Returns the leaf's docId↔row translator, or null for flat segments. Cached per
+     * leaf ord — the layout is immutable per reader, and building it costs a postings
+     * pass we don't want per collector.
+     */
+    private NestedParentLayout layoutFor(LeafReaderContext leaf) throws IOException {
+        LayoutSlot slot = layoutsByLeafOrd.get(leaf.ord);
+        if (slot == null) {
+            slot = new LayoutSlot(NestedParentLayout.of(leaf.reader()));
+            layoutsByLeafOrd.putIfAbsent(leaf.ord, slot);
+        }
+        return slot.layout;
+    }
+
+    /** Nullable-value wrapper so flat leaves (layout == null) are cached too. */
+    private static final class LayoutSlot {
+        final NestedParentLayout layout;
+
+        LayoutSlot(NestedParentLayout layout) {
+            this.layout = layout;
+        }
+    }
+
     private static final class ScorerHandle {
         final Scorer scorer;
+        /** Partition bounds: docIds for flat segments, LOGICAL ROWS for nested ones. */
         final int partitionMinDoc;
         final int partitionMaxDoc;
+        /** DocId↔row translator; null for flat segments (docId == row). */
+        final NestedParentLayout layout;
         int currentDoc = -1;
 
-        ScorerHandle(Scorer scorer, int partitionMinDoc, int partitionMaxDoc) {
+        ScorerHandle(Scorer scorer, int partitionMinDoc, int partitionMaxDoc, NestedParentLayout layout) {
             this.scorer = scorer;
             this.partitionMinDoc = partitionMinDoc;
             this.partitionMaxDoc = partitionMaxDoc;
+            this.layout = layout;
         }
     }
 }
