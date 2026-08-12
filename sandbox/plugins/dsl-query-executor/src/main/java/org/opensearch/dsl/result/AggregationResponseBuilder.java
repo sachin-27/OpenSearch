@@ -16,6 +16,7 @@ import org.opensearch.dsl.aggregation.GroupingInfo;
 import org.opensearch.dsl.aggregation.bucket.BucketTranslator;
 import org.opensearch.dsl.aggregation.metric.MetricTranslator;
 import org.opensearch.dsl.converter.ConversionException;
+import org.opensearch.dsl.profile.DslPhaseStats;
 import org.opensearch.dsl.util.ComparisonUtils;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.InternalAggregation;
@@ -130,7 +131,7 @@ public final class AggregationResponseBuilder {
             return buildEmptyMetric(translator, agg);
         }
 
-        List<Object[]> rows = StreamSupport.stream(result.getRows().spliterator(), false).collect(Collectors.toList());
+        List<Object[]> rows = materialize(result);
 
         if (rows.isEmpty()) {
             return buildEmptyMetric(translator, agg);
@@ -145,7 +146,27 @@ public final class AggregationResponseBuilder {
 
         Object[] matchingRow = findMatchingRow(rows, colIndex, parentKeyFilter);
         Object value = (matchingRow != null) ? matchingRow[colIdx] : null;
-        return translator.toInternalAggregation(agg.getName(), value, AggregationTranslator.userMetadata(agg));
+        long packageStart = DslPhaseStats.DETAIL ? System.nanoTime() : 0L;
+        InternalAggregation metric = translator.toInternalAggregation(agg.getName(), value, AggregationTranslator.userMetadata(agg));
+        if (DslPhaseStats.DETAIL) {
+            DslPhaseStats.record(DslPhaseStats.Phase.PACKAGE, System.nanoTime() - packageStart);
+        }
+        return metric;
+    }
+
+    /**
+     * Drains one granularity's rows into a re-readable list. The builder makes several passes over
+     * them (filter, group, per-bucket recursion), so the executor's iterable is materialized once
+     * per call.
+     */
+    private static List<Object[]> materialize(ExecutionResult result) {
+        long start = DslPhaseStats.DETAIL ? System.nanoTime() : 0L;
+        List<Object[]> rows = StreamSupport.stream(result.getRows().spliterator(), false).collect(Collectors.toList());
+        if (DslPhaseStats.DETAIL) {
+            DslPhaseStats.record(DslPhaseStats.Phase.MATERIALIZE, System.nanoTime() - start);
+            DslPhaseStats.add(DslPhaseStats.Counter.ROWS, rows.size());
+        }
+        return rows;
     }
 
     /**
@@ -183,7 +204,7 @@ public final class AggregationResponseBuilder {
             return buildEmptyBucket(translator, agg);
         }
 
-        List<Object[]> rows = StreamSupport.stream(result.getRows().spliterator(), false).collect(Collectors.toList());
+        List<Object[]> rows = materialize(result);
 
         if (rows.isEmpty()) {
             return buildEmptyBucket(translator, agg);
@@ -194,7 +215,11 @@ public final class AggregationResponseBuilder {
 
         List<String> currentGroupColumns = new ArrayList<>(grouping.getFieldNames());
 
+        long groupStart = DslPhaseStats.DETAIL ? System.nanoTime() : 0L;
         Map<List<Object>, List<Object[]>> grouped = groupRowsByKeys(filteredRows, currentGroupColumns, colIndex);
+        if (DslPhaseStats.DETAIL) {
+            DslPhaseStats.record(DslPhaseStats.Phase.GROUP, System.nanoTime() - groupStart);
+        }
 
         Integer countIdx = colIndex.get(AggregationMetadataBuilder.IMPLICIT_COUNT_NAME);
         if (countIdx == null) {
@@ -220,7 +245,13 @@ public final class AggregationResponseBuilder {
             buckets.add(new BucketEntry(entry.getKey(), docCount, subAggregations));
         }
 
-        return translator.toBucketAggregation(agg, buckets);
+        long packageStart = DslPhaseStats.DETAIL ? System.nanoTime() : 0L;
+        InternalAggregation bucketAgg = translator.toBucketAggregation(agg, buckets);
+        if (DslPhaseStats.DETAIL) {
+            DslPhaseStats.record(DslPhaseStats.Phase.PACKAGE, System.nanoTime() - packageStart);
+            DslPhaseStats.add(DslPhaseStats.Counter.BUCKETS, buckets.size());
+        }
+        return bucketAgg;
     }
 
     /**

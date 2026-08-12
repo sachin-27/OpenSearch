@@ -11,18 +11,26 @@ package org.opensearch.dsl;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.support.ActionFilter;
 import org.opensearch.cluster.metadata.IndexNameExpressionResolver;
+import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterService;
+import org.opensearch.common.settings.ClusterSettings;
+import org.opensearch.common.settings.IndexScopedSettings;
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.settings.SettingsFilter;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.dsl.action.DslExecuteAction;
 import org.opensearch.dsl.action.SearchActionFilter;
 import org.opensearch.dsl.action.TransportDslExecuteAction;
+import org.opensearch.dsl.rest.RestDslStatsAction;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.repositories.RepositoriesService;
+import org.opensearch.rest.RestController;
+import org.opensearch.rest.RestHandler;
 import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
@@ -71,5 +79,18 @@ public class DslQueryExecutorPlugin extends Plugin implements ActionPlugin {
     @Override
     public List<ActionFilter> getActionFilters() {
         return searchActionFilter != null ? List.of(searchActionFilter) : List.of();
+    }
+
+    @Override
+    public List<RestHandler> getRestHandlers(
+        Settings settings,
+        RestController restController,
+        ClusterSettings clusterSettings,
+        IndexScopedSettings indexScopedSettings,
+        SettingsFilter settingsFilter,
+        IndexNameExpressionResolver indexNameExpressionResolver,
+        Supplier<DiscoveryNodes> nodesInCluster
+    ) {
+        return List.of(new RestDslStatsAction());
     }
 }

@@ -25,6 +25,7 @@ import org.opensearch.core.index.Index;
 import org.opensearch.dsl.converter.SearchSourceConverter;
 import org.opensearch.dsl.executor.DslQueryPlanExecutor;
 import org.opensearch.dsl.executor.QueryPlans;
+import org.opensearch.dsl.profile.DslPhaseStats;
 import org.opensearch.dsl.result.SearchResponseBuilder;
 import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
@@ -92,7 +93,12 @@ public class TransportDslExecuteAction extends HandledTransportAction<SearchRequ
                 listener.onFailure(e);
                 return;
             }
+            final long convertedNanos = System.nanoTime();
+            DslPhaseStats.record(DslPhaseStats.Phase.CONVERT, convertedNanos - startNanos);
+
             planExecutor.execute(plans, ActionListener.wrap(results -> {
+                final long executedNanos = System.nanoTime();
+                DslPhaseStats.record(DslPhaseStats.Phase.EXECUTE, executedNanos - convertedNanos);
                 final SearchResponse response;
                 try {
                     long tookInMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
@@ -102,6 +108,8 @@ public class TransportDslExecuteAction extends HandledTransportAction<SearchRequ
                     listener.onFailure(buildEx);
                     return;
                 }
+                DslPhaseStats.record(DslPhaseStats.Phase.BUILD, System.nanoTime() - executedNanos);
+                DslPhaseStats.add(DslPhaseStats.Counter.REQUESTS, 1);
                 listener.onResponse(response);
             }, e -> {
                 logger.error("DSL execution failed", e);
