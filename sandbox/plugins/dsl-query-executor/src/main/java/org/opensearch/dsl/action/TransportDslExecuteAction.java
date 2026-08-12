@@ -86,15 +86,21 @@ public class TransportDslExecuteAction extends HandledTransportAction<SearchRequ
             final SearchSourceConverter converter;
             try {
                 String indexName = resolveToSingleIndex(request);
+                long resolvedNanos = System.nanoTime();
+                DslPhaseStats.record(DslPhaseStats.Phase.RESOLVE_INDEX, resolvedNanos - startNanos);
+
                 converter = new SearchSourceConverter(contextProvider.getContext().schema());
+                long initializedNanos = System.nanoTime();
+                DslPhaseStats.record(DslPhaseStats.Phase.CONVERTER_INIT, initializedNanos - resolvedNanos);
+
                 plans = converter.convert(request.source(), indexName);
+                DslPhaseStats.record(DslPhaseStats.Phase.CONVERT, System.nanoTime() - initializedNanos);
             } catch (Exception e) {
                 logger.error("DSL conversion failed", e);
                 listener.onFailure(e);
                 return;
             }
             final long convertedNanos = System.nanoTime();
-            DslPhaseStats.record(DslPhaseStats.Phase.CONVERT, convertedNanos - startNanos);
 
             planExecutor.execute(plans, ActionListener.wrap(results -> {
                 final long executedNanos = System.nanoTime();

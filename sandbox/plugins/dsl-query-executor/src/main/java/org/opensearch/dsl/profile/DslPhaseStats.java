@@ -37,7 +37,11 @@ public final class DslPhaseStats {
 
     /** A timed stage of the pipeline. */
     public enum Phase {
-        /** DSL to Calcite plan conversion, including per-request planning infrastructure setup. */
+        /** Resolving the request's aliases and wildcards to a single concrete index. */
+        RESOLVE_INDEX,
+        /** Per-request construction of the Calcite planning infrastructure and sub-converters. */
+        CONVERTER_INIT,
+        /** Translating the DSL into Calcite plans: query, aggregation tree walk, plan assembly. */
         CONVERT,
         /** Handing plans to the analytics engine until results arrive. */
         EXECUTE,
