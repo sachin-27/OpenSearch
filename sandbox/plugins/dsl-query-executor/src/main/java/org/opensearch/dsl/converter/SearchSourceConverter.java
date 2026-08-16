@@ -32,9 +32,12 @@ import org.opensearch.dsl.query.QueryRegistryFactory;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.builder.SearchSourceBuilder;
 
+import org.opensearch.index.mapper.MapperService;
+
 import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
+import java.util.function.Supplier;
 
 /**
  * Converts {@link SearchSourceBuilder} DSL into Calcite {@link QueryPlans}.
@@ -46,8 +49,8 @@ public class SearchSourceConverter {
 
     /** Immutable after creation with stateless translators — shared across all requests. */
     private static final QueryRegistry QUERY_REGISTRY = QueryRegistryFactory.create();
-    private static final AggregationRegistry AGG_REGISTRY = AggregationRegistryFactory.create();
 
+    private final AggregationRegistry aggRegistry;
     private final RelOptCluster cluster;
     private final CalciteCatalogReader catalogReader;
     private final FilterConverter filterConverter;
@@ -58,11 +61,12 @@ public class SearchSourceConverter {
     private final AggregationTreeWalker treeWalker;
 
     /**
-     * Initializes planning infrastructure from the given schema.
+     * Initializes planning infrastructure from the given schema with MapperService support.
      *
      * @param schema Calcite schema with index tables from the analytics engine
+     * @param mapperServiceSupplier supplies the MapperService for the target index (for type/format resolution)
      */
-    public SearchSourceConverter(SchemaPlus schema) {
+    public SearchSourceConverter(SchemaPlus schema, Supplier<MapperService> mapperServiceSupplier) {
         // TODO: Once Analytics plugin starts providing the RelOptTable, use it directly —
         // no need to reconstruct typeFactory, CatalogReader, and planning infrastructure here.
         RelDataTypeFactory typeFactory = new SqlTypeFactoryImpl(RelDataTypeSystem.DEFAULT);
@@ -83,12 +87,13 @@ public class SearchSourceConverter {
         this.aggConverter = new AggregateConverter();
         this.postAggConverter = new PostAggregateConverter();
 
-        this.treeWalker = new AggregationTreeWalker(AGG_REGISTRY);
+        this.aggRegistry = AggregationRegistryFactory.create(mapperServiceSupplier);
+        this.treeWalker = new AggregationTreeWalker(aggRegistry);
     }
 
     /** Returns the aggregation registry used by this converter. */
     public AggregationRegistry getAggregationRegistry() {
-        return AGG_REGISTRY;
+        return aggRegistry;
     }
 
     /**
