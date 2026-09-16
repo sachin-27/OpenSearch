@@ -12,6 +12,7 @@ import org.apache.lucene.document.Document;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.FilterLeafReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
 import org.apache.lucene.index.LeafReader;
@@ -33,6 +34,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class DerivedSourceDirectoryReaderTests extends OpenSearchTestCase {
 
@@ -115,6 +117,55 @@ public class DerivedSourceDirectoryReaderTests extends OpenSearchTestCase {
         assertFalse("Should have leaf calls recorded", leafCalls.isEmpty());
     }
 
+    /**
+     * The derive path must receive a doc-values-caching view of the leaf, so that rebuilding
+     * source for many documents opens one doc-values iterator per field rather than one per
+     * document (on columnar codecs each open is an expensive native call). Verifies both the
+     * type of the reader handed to the provider and the memoization behavior itself.
+     */
+    public void testSourceProviderReceivesDocValuesCachingView() throws IOException {
+        AtomicReference<LeafReader> seenReader = new AtomicReference<>();
+        AtomicReference<Object> firstIterator = new AtomicReference<>();
+        AtomicReference<Object> secondIterator = new AtomicReference<>();
+
+        CheckedBiFunction<LeafReader, Integer, BytesReference, IOException> capturingProvider = (leafReader, docId) -> {
+            seenReader.set(leafReader);
+            // Same field asked twice within one derive call — must be the same iterator.
+            firstIterator.set(leafReader.getSortedNumericDocValues("num"));
+            secondIterator.set(leafReader.getSortedNumericDocValues("num"));
+            return new BytesArray(TEST_SOURCE);
+        };
+
+        try (Directory dvDir = newDirectory()) {
+            IndexWriter dvWriter = new IndexWriter(dvDir, newIndexWriterConfig(random(), null));
+            Document doc = new Document();
+            doc.add(new StoredField("_source", TEST_SOURCE));
+            doc.add(new org.apache.lucene.document.SortedNumericDocValuesField("num", 42));
+            dvWriter.addDocument(doc);
+            dvWriter.commit();
+
+            try (DirectoryReader dvDirectoryReader = DirectoryReader.open(dvWriter)) {
+                DerivedSourceDirectoryReader wrapped = DerivedSourceDirectoryReader.wrap(dvDirectoryReader, capturingProvider);
+                StoredFields storedFields = wrapped.leaves().get(0).reader().storedFields();
+                storedFields.document(0, new StoredFieldVisitor() {
+                    @Override
+                    public Status needsField(FieldInfo fieldInfo) {
+                        return fieldInfo.name.equals("_source") ? Status.YES : Status.NO;
+                    }
+                });
+            }
+            dvWriter.close();
+        }
+
+        assertNotNull("provider should have been invoked", seenReader.get());
+        assertTrue(
+            "provider must receive a DocValuesCachingLeafReader, got " + seenReader.get().getClass(),
+            seenReader.get() instanceof DocValuesCachingLeafReader
+        );
+        assertNotNull(firstIterator.get());
+        assertSame("repeated doc-values lookups must be memoized", firstIterator.get(), secondIterator.get());
+    }
+
     public void testWithMultipleSegments() throws IOException {
         // Create index with multiple segments
         Directory multiDir = newDirectory();
@@ -156,8 +207,9 @@ public class DerivedSourceDirectoryReaderTests extends OpenSearchTestCase {
         }
 
         DerivedSourceDirectoryReader derivedReader = DerivedSourceDirectoryReader.wrap(multiReader, (leafReader, docId) -> {
-            // Use the segment-specific map to get the correct source
-            Map<Integer, byte[]> segmentMap = segmentSources.get(leafReader.toString());
+            // The provider receives a doc-values-caching view of the leaf, not the leaf itself;
+            // unwrap to the original reader to key the segment-specific source map.
+            Map<Integer, byte[]> segmentMap = segmentSources.get(FilterLeafReader.unwrap(leafReader).toString());
             return new BytesArray(segmentMap.get(docId));
         });
 

@@ -35,13 +35,16 @@ package org.opensearch.index.mapper;
 import org.apache.lucene.document.InvertableType;
 import org.apache.lucene.document.StoredField;
 import org.apache.lucene.document.StoredValue;
+import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.OpenSearchException;
 import org.opensearch.common.io.stream.BytesStreamOutput;
+import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.util.CollectionUtils;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.fielddata.IndexFieldData;
 import org.opensearch.index.fielddata.plain.BytesBinaryIndexFieldData;
@@ -82,21 +85,52 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
     public static class Builder extends ParametrizedFieldMapper.Builder {
 
         private final Parameter<Boolean> stored = Parameter.storeParam(m -> toType(m).stored, false);
-        private final Parameter<Boolean> hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, false);
+        private final Parameter<Boolean> hasDocValues;
+        private final Parameter<MappedFieldType.MultiValueState> multiValue = multiValueParameter();
         private final Parameter<Map<String, String>> meta = Parameter.metaParam();
+        private final boolean pluggableDataFormat;
 
         public Builder(String name) {
-            this(name, false);
+            this(name, false, false);
+        }
+
+        /**
+         * Defaults doc values to on when the index uses a pluggable data format, off otherwise.
+         *
+         * <p>On the Lucene path a binary field has no query surface, so writing doc values by default
+         * would be cost without a consumer, and the upstream default of {@code false} is kept. Under a
+         * pluggable data format the values are held in the columnar store whether or not the mapping
+         * opts in, and derived source is force-enabled, so a field left at {@code false} would fail
+         * {@link BinaryFieldMapper#canDeriveSourceInternal()} for values that are in fact readable.
+         * Defaulting rather than forcing keeps an explicit {@code doc_values} in the mapping
+         * authoritative either way.
+         */
+        public Builder(String name, Settings indexSettings) {
+            this(name, Mapper.isPluggableDataFormatEnabled(indexSettings), Mapper.isPluggableDataFormatEnabled(indexSettings));
         }
 
         public Builder(String name, boolean hasDocValues) {
+            this(name, hasDocValues, false);
+        }
+
+        /**
+         * @param pluggableDataFormat whether the index stores field values in a pluggable
+         *                            (columnar) data format rather than Lucene. Affects the
+         *                            derived-source read preference: pluggable indexes never
+         *                            write Lucene stored fields for user fields, so derive
+         *                            must read doc values even when {@code store: true}.
+         */
+        public Builder(String name, boolean hasDocValues, boolean pluggableDataFormat) {
             super(name);
-            this.hasDocValues.setValue(hasDocValues);
+            // Set as the parameter's default rather than via setValue, so that a doc_values in the mapping
+            // is still recorded as explicitly configured and still overrides this.
+            this.hasDocValues = Parameter.docValuesParam(m -> toType(m).hasDocValues, hasDocValues);
+            this.pluggableDataFormat = pluggableDataFormat;
         }
 
         @Override
         public List<Parameter<?>> getParameters() {
-            return Arrays.asList(meta, stored, hasDocValues);
+            return Arrays.asList(meta, stored, hasDocValues, multiValue);
         }
 
         @Override
@@ -107,11 +141,12 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
                 hasDocValues.getValue(),
                 meta.getValue()
             );
+            bft.setMultiValueState(multiValue.getValue());
             return new BinaryFieldMapper(name, bft, multiFieldsBuilder.build(this, context), copyTo.build(), this);
         }
     }
 
-    public static final TypeParser PARSER = new TypeParser((n, c) -> new Builder(n));
+    public static final TypeParser PARSER = new TypeParser((n, c) -> new Builder(n, c.getSettings()));
 
     /**
      * Binary field type
@@ -122,6 +157,10 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
 
         private BinaryFieldType(String name, boolean isStored, boolean hasDocValues, Map<String, String> meta) {
             super(name, false, isStored, hasDocValues, TextSearchInfo.NONE, meta);
+            // Multi-valued binary is storable as a Parquet LIST<BINARY> column; the classic Lucene
+            // path has always accepted arrays (CustomBinaryDocValuesField packs them), so support
+            // is unconditional and the multi_value parameter/promotion only changes columnar layout.
+            setMultiValueSupported(true);
         }
 
         public BinaryFieldType(String name) {
@@ -176,6 +215,8 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
 
     private final boolean stored;
     private final boolean hasDocValues;
+    private final boolean hasDocValuesByDefault;
+    private final boolean pluggableDataFormat;
 
     protected BinaryFieldMapper(
         String simpleName,
@@ -187,6 +228,8 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
         super(simpleName, mappedFieldType, multiFields, copyTo);
         this.stored = builder.stored.getValue();
         this.hasDocValues = builder.hasDocValues.getValue();
+        this.hasDocValuesByDefault = builder.hasDocValues.getDefaultValue();
+        this.pluggableDataFormat = builder.pluggableDataFormat;
     }
 
     @Override
@@ -224,7 +267,10 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
         if (value == null) {
             return;
         }
-        context.documentInput().addField(fieldType(), value);
+        // Routes through the shared multi-value gate: a second value for this field either
+        // accumulates (LIST state), publishes the scalar-to-LIST promotion (AUTO), or rejects
+        // (locked SCALAR) — matching the classic path, which accepts arrays unconditionally.
+        addFieldForPluggableFormat(context, value);
     }
 
     private byte[] parseBinaryValue(ParseContext context) throws IOException {
@@ -241,7 +287,14 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
 
     @Override
     public ParametrizedFieldMapper.Builder getMergeBuilder() {
-        return new BinaryFieldMapper.Builder(simpleName()).init(this);
+        // Carry over the default this mapper was built with rather than either the upstream false or this
+        // mapper's own hasDocValues, following NumberFieldMapper's handling of ignoreMalformedByDefault.
+        // init() copies the value across, so the merged mapper is unaffected by the choice, but
+        // serialization is not: doXContentBody goes through this builder and omits any parameter whose
+        // value equals its default. Using false would drop an explicit doc_values: false on an index that
+        // defaults it on, and re-parsing that output would silently flip the field back to true; using
+        // hasDocValues would instead drop an explicit doc_values: true on the Lucene path.
+        return new BinaryFieldMapper.Builder(simpleName(), hasDocValuesByDefault, pluggableDataFormat).init(this);
     }
 
     @Override
@@ -251,15 +304,47 @@ public class BinaryFieldMapper extends ParametrizedFieldMapper {
 
     @Override
     protected void canDeriveSourceInternal() {
-        checkStoredForDerivedSource();
+        checkStoredAndDocValuesForDerivedSource();
     }
 
+    /**
+     * 1. If the field is stored on a Lucene index, build source from the stored field, which preserves the
+     *    values verbatim.
+     * 2. Otherwise build it from doc values. Note that binary doc values are sorted and deduplicated on write by
+     *    {@link CustomBinaryDocValuesField#binaryValue()}, so a multi valued field loses the original ordering and any
+     *    duplicate values. This matches the behaviour of the other doc values backed field types.
+     *
+     * <p>On a pluggable-data-format index the stored preference is never taken, even with {@code store: true}:
+     * such indexes write no Lucene stored fields for user fields — the value is routed to the columnar store
+     * (which claims the STORED_FIELDS capability) and is readable back only through the doc-values view the
+     * codec synthesizes. Preferring STORED there would make the fetcher consult the Lucene segment's
+     * (empty) stored fields and silently drop the field from the derived source — the exact failure mode for
+     * the {@code store: true, doc_values: false} mapping, which is the one legal way to disable doc values on
+     * a pluggable index.
+     */
     @Override
     protected DerivedFieldGenerator derivedFieldGenerator() {
-        return new DerivedFieldGenerator(mappedFieldType, null, new StoredFieldFetcher(mappedFieldType, simpleName())) {
+        // Construction-order note: this method runs from the FieldMapper super-constructor,
+        // BEFORE this subclass's pluggableDataFormat field is assigned. The preference must
+        // therefore be evaluated per call (it reads the field lazily), and generate() must
+        // select the fetcher per call rather than trusting the fetcher the super constructor
+        // snapshotted from a not-yet-initialized preference.
+        final FieldValueFetcher docValuesFetcher = new BinaryDocValuesFetcher(mappedFieldType, simpleName());
+        final FieldValueFetcher storedFieldFetcher = new StoredFieldFetcher(mappedFieldType, simpleName());
+        return new DerivedFieldGenerator(mappedFieldType, docValuesFetcher, storedFieldFetcher) {
             @Override
             public FieldValueType getDerivedFieldPreference() {
-                return FieldValueType.STORED;
+                return (mappedFieldType.isStored() && pluggableDataFormat == false)
+                    ? FieldValueType.STORED
+                    : FieldValueType.DOC_VALUES;
+            }
+
+            @Override
+            public void generate(XContentBuilder builder, LeafReader reader, int docId) throws IOException {
+                final FieldValueFetcher fetcher = getDerivedFieldPreference() == FieldValueType.DOC_VALUES
+                    ? docValuesFetcher
+                    : storedFieldFetcher;
+                fetcher.write(builder, fetcher.fetch(reader, docId));
             }
         };
     }

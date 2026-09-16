@@ -20,12 +20,16 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
+import org.opensearch.index.mapper.BinaryFieldMapper;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
+import org.opensearch.parquet.bridge.BinaryPageReader;
 import org.opensearch.parquet.bridge.DataFusionColumnReader;
 import org.opensearch.parquet.bridge.ParquetFileMetadata;
 import org.opensearch.parquet.bridge.RustBridge;
 import org.opensearch.parquet.codec.cache.BufferPool;
+import org.opensearch.parquet.codec.iter.BinaryFramingDocValues;
+import org.opensearch.parquet.codec.iter.BinaryListFramingDocValues;
 import org.opensearch.parquet.codec.iter.ParquetBinaryDocValues;
 import org.opensearch.parquet.codec.iter.ParquetNumericDocValues;
 import org.opensearch.parquet.codec.iter.ParquetSortedDocValues;
@@ -157,6 +161,13 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
      * the Parquet file backing it never changes shape once written.
      */
     private final Map<String, Boolean> repeatedColumns = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Memoized {@link #nonNullRowCount} per field ({@code -1} = footer stats can't say), same
+     * rationale as {@link #repeatedColumns}: a footer fact that never changes once written.
+     * Feeds the dense-variant verdict and iterator {@code cost()} in {@link #getBinary}.
+     */
+    private final Map<String, Long> nonNullRowCounts = new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.List<java.io.Closeable> dedicatedReaders = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
     /** Optional per-query accumulator; propagated to each column reader so its stats roll up at close. */
@@ -230,7 +241,33 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     public BinaryDocValues getBinary(FieldInfo field) throws IOException {
         ensureOpen();
         validate(field, DocValuesType.BINARY);
-        return new ParquetBinaryDocValues(dedicatedReaderFor(field, false), maxDoc);
+        // Route on the column's physical shape, not the mapping: a field promoted to multi_value
+        // keeps scalar columns in segments written before the promotion, and only the file's own
+        // schema knows which shape this segment holds. Only mapping-type binary can be a repeated
+        // BINARY-typed column (text does not support multi_value), and its consumers decode the
+        // framed encoding, which carries the value count — so the repeated reader frames directly.
+        if (isRepeated(field)) {
+            assert isBinaryMappingType(field) : "repeated BINARY doc values are only produced for binary fields";
+            return new BinaryListFramingDocValues(dedicatedReaderFor(field, true), maxDoc);
+        }
+        // Footer-stats density verdict: a column with every row present iterates arithmetically
+        // (segment-wide docIDRunEnd/intoBitSet), which is what lets exists queries be counted as
+        // ranges instead of stepped 10M times. -1 (stats unknown) degrades to the page-aware path.
+        long nonNull = nonNullRowCountMemoized(field);
+        boolean dense = nonNull == maxDoc;
+        BinaryDocValues binary = new ParquetBinaryDocValues(
+            dedicatedReaderFor(field, false),
+            maxDoc,
+            dense,
+            nonNull < 0 ? maxDoc : nonNull
+        );
+        // Parquet stores the value itself, unframed. A binary field's doc values consumers expect the
+        // field type's own encoding (value count + per-value length), so add it here. Other field types
+        // mapped to BINARY doc values, notably text, read the value raw and must not be framed.
+        if (isBinaryMappingType(field)) {
+            binary = new BinaryFramingDocValues(binary);
+        }
+        return binary;
     }
 
     @Override
@@ -255,19 +292,39 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
      * min/max/null-count), letting Lucene's range machinery skip whole pages whose stats
      * exclude the query range — no decode, no FFM crossing for skipped pages.
      *
-     * <p>Integer-shaped columns only (INT32/INT64/BOOL physical): their raw-bits order is
-     * numeric order. Float/double doc values are IEEE-754 raw bits whose order diverges from
-     * numeric order for negative values, so page min/max computed on bits would be wrong for
-     * them; they get no skipper. BYTE_ARRAY min/max is not exchanged as i64 at all.
+     * <p>Integer-shaped columns (INT32/INT64/BOOL physical) get full range stats: their
+     * raw-bits order is numeric order. Float/double doc values are IEEE-754 raw bits whose
+     * order diverges from numeric order for negative values, so page min/max computed on bits
+     * would be wrong for them; they get no skipper.
+     *
+     * <p>Ordered BYTE_ARRAY columns (keyword/ip, whose DV type is {@code SORTED}) get an
+     * existence-only skipper: their min/max is not exchanged as i64, so the native page-index
+     * load reports the unknown sentinel ({@code Long.MIN_VALUE}, {@code Long.MAX_VALUE}) for
+     * every page — which intersects every query range and therefore never wrongly skips —
+     * while the per-page null counts are exact. Consumers that only need presence (notably
+     * {@code exists} queries via {@code FieldExistsQuery}) can skip all-null pages and take
+     * dense-field fast paths ({@code docCount() == maxDoc}) without decoding a single page.
+     *
+     * <p>{@link DocValuesType#BINARY} columns ({@code binary}, {@code text}) get no skipper
+     * even though their page stats would serve presence: Lucene only permits a RANGE skip
+     * index on the ordered doc-values kinds (see {@code DocValuesSkipIndexType.RANGE}), so a
+     * BINARY field can never advertise one and any skipper returned here would be unreachable.
      */
     @Override
     public DocValuesSkipper getSkipper(FieldInfo field) throws IOException {
         ensureOpen();
         ParquetPhysicalType phys = physicalType(field);
-        if (phys != ParquetPhysicalType.INT32 && phys != ParquetPhysicalType.INT64 && phys != ParquetPhysicalType.BOOL) {
+        if (phys != ParquetPhysicalType.INT32
+            && phys != ParquetPhysicalType.INT64
+            && phys != ParquetPhysicalType.BOOL
+            && phys != ParquetPhysicalType.BYTE_ARRAY) {
             return null;
         }
-        if (field.getDocValuesType() == DocValuesType.SORTED_NUMERIC) {
+        if (field.getDocValuesType() == DocValuesType.BINARY) {
+            // Unordered: Lucene forbids a RANGE skip index here, so no consumer can reach this.
+            return null;
+        }
+        if (field.getDocValuesType() == DocValuesType.SORTED_NUMERIC || field.getDocValuesType() == DocValuesType.SORTED_SET) {
             // Repeated values may span Parquet pages, so OffsetIndex page rows do not
             // define independent Lucene document ranges. Do not expose unsafe stats.
             return null;
@@ -329,6 +386,7 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         dedicatedReaders.clear();
         dataFusionColumnReaders.clear();
         repeatedColumns.clear();
+        nonNullRowCounts.clear();
         bufferPool.close();
         if (first != null) {
             throw first;
@@ -343,6 +401,19 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
             return; // low-level tests may bypass mapping validation
         }
         FieldTypeMapping.validate(field.getName(), mappingType(field), requested);
+    }
+
+    /**
+     * Whether the mapping types this field as {@code binary}. False when no mapper is present, as in
+     * the low-level tests that construct a producer without one: those assert on the Parquet column's
+     * own bytes, so the framing must stay off for them.
+     */
+    private boolean isBinaryMappingType(FieldInfo field) {
+        if (mapperService == null) {
+            return false;
+        }
+        MappedFieldType mft = mapperService.fieldType(field.getName());
+        return mft != null && BinaryFieldMapper.CONTENT_TYPE.equals(mft.typeName());
     }
 
     private String mappingType(FieldInfo field) {
@@ -403,6 +474,18 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         return repeated;
     }
 
+    /**
+     * A dedicated reader for serving {@code stored_fields} requests from the Parquet column.
+     * Binary fields with {@code store: true} claim the STORED_FIELDS capability for the Parquet
+     * format — the value lives in the column, not in Lucene stored files — so the stored-fields
+     * read surface ({@code ParquetDocValuesLeafReader}'s wrappers) reads it back from here.
+     * Same instance-scoped-cursor rationale as {@link #dedicatedReaderFor}; registered for close
+     * with the producer.
+     */
+    BinaryPageReader storedBinaryReaderFor(FieldInfo field, boolean repeated) throws IOException {
+        return dedicatedReaderFor(field, repeated);
+    }
+
     long nonNullRowCount(FieldInfo field) throws IOException {
         org.opensearch.parquet.codec.cache.ColumnPageIndex idx = dataFusionReaderFor(field, false).pageIndex();
         long nonNull = 0;
@@ -416,12 +499,17 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         return nonNull;
     }
 
-    // <<<<<<< HEAD
-    // private synchronized BinaryPageReader binaryReaderFor(FieldInfo field, boolean repeated) throws IOException {
-    // // Sorted iterators need instance-scoped cursors (shared producers are accessed
-    // // concurrently), so each gets a dedicated reader with instance-unique pool slots.
-    // DataFusionColumnReader reader = DataFusionColumnReader.openDeferred(
-    // =======
+    /** {@link #nonNullRowCount} through {@link #nonNullRowCounts}; same benign-race pattern as {@link #isRepeated}. */
+    private long nonNullRowCountMemoized(FieldInfo field) throws IOException {
+        Long cached = nonNullRowCounts.get(field.getName());
+        if (cached != null) {
+            return cached;
+        }
+        long counted = nonNullRowCount(field);
+        nonNullRowCounts.put(field.getName(), counted);
+        return counted;
+    }
+
     /**
      * A dedicated (non-shared) column reader for one streaming iterator. Every value-reading
      * accessor (numeric, binary, sorted, sorted-set) routes here: under concurrent segment search

@@ -36,7 +36,10 @@ public class FieldTypeMappingTests extends OpenSearchTestCase {
 
     public void testTextAndBinaryMappings() {
         assertMapping("text", DocValuesType.BINARY, DocValuesType.NONE, ParquetPhysicalType.BYTE_ARRAY);
-        assertMapping("binary", DocValuesType.BINARY, DocValuesType.NONE, ParquetPhysicalType.BYTE_ARRAY);
+        // Binary's multi-valued form keeps the BINARY DV type: multiplicity lives inside the
+        // framed encoding (value count + per-value length), not in the declared Lucene type, and
+        // the reader routes scalar vs LIST segments on the column's physical shape.
+        assertMapping("binary", DocValuesType.BINARY, DocValuesType.BINARY, ParquetPhysicalType.BYTE_ARRAY);
     }
 
     public void testUnsupportedTypeThrows() {

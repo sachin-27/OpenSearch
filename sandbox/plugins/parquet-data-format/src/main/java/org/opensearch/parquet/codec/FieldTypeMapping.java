@@ -43,7 +43,12 @@ public final class FieldTypeMapping {
         Map.entry("keyword", new Mapping(DocValuesType.SORTED, DocValuesType.SORTED_SET, ParquetPhysicalType.BYTE_ARRAY)),
         Map.entry("ip", new Mapping(DocValuesType.SORTED, DocValuesType.SORTED_SET, ParquetPhysicalType.BYTE_ARRAY)),
         Map.entry("text", new Mapping(DocValuesType.BINARY, DocValuesType.NONE, ParquetPhysicalType.BYTE_ARRAY)),
-        Map.entry("binary", new Mapping(DocValuesType.BINARY, DocValuesType.NONE, ParquetPhysicalType.BYTE_ARRAY))
+        // Binary's multi-valued form keeps the BINARY doc-values type: unlike numerics, where
+        // multiplicity is expressed by a different Lucene DV type (SORTED_NUMERIC), a binary
+        // field's framed encoding (value count + per-value length) carries multiplicity inside
+        // the single per-document BytesRef, so consumers dispatch identically either way. The
+        // reader routes scalar vs LIST segments on the column's physical shape, not this type.
+        Map.entry("binary", new Mapping(DocValuesType.BINARY, DocValuesType.BINARY, ParquetPhysicalType.BYTE_ARRAY))
     );
 
     private FieldTypeMapping() {}

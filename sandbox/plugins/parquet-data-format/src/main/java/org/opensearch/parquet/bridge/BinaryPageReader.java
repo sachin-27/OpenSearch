@@ -8,6 +8,7 @@
 
 package org.opensearch.parquet.bridge;
 
+import org.opensearch.parquet.codec.cache.ColumnPageIndex;
 import org.opensearch.parquet.codec.cache.PageCache;
 
 import java.io.IOException;
@@ -17,6 +18,17 @@ public interface BinaryPageReader {
 
     /** The currently decoded row range, or {@code null} when none is loaded. */
     PageCache cache();
+
+    /**
+     * Per-page statistics for the column (row ranges and null counts), or {@code null} when
+     * unavailable. Lets presence questions ("does row N have a value?") be answered for fully
+     * dense and fully null pages without decoding any page — the basis of the exists fast path
+     * in {@code ParquetBinaryDocValues}. Implementations that cannot serve stats keep the
+     * default and readers fall back to decoding.
+     */
+    default ColumnPageIndex pageIndex() throws IOException {
+        return null;
+    }
 
     /** Loads a decoded range containing {@code row}. */
     void loadPageContaining(long row) throws IOException;

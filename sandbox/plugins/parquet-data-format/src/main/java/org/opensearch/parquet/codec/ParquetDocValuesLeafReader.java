@@ -26,6 +26,8 @@ import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.index.StoredFieldVisitor;
+import org.apache.lucene.index.StoredFields;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
 import org.apache.lucene.store.IOContext;
@@ -34,11 +36,13 @@ import org.opensearch.common.lucene.index.SequentialStoredFieldsLeafReader;
 import org.opensearch.index.engine.dataformat.DocumentInput;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
+import org.opensearch.parquet.bridge.BinaryPageReader;
 import org.opensearch.parquet.codec.iter.ParquetDictionarySortedDocValues;
 import org.opensearch.parquet.codec.iter.ParquetSortedDocValues;
 import org.opensearch.parquet.codec.iter.ParquetUninvertedSortedDocValues;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -96,6 +100,9 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     /** Field name -> synthetic FieldInfo for Parquet-resident DV fields served by this reader. */
     private final Map<String, FieldInfo> parquetFields;
 
+    /** Fields whose stored values are served from the Parquet column; see selectParquetStoredFields. */
+    private final Map<String, FieldInfo> parquetStoredFields;
+
     /** Request-scoped uninverted-ordinal leases keyed by field, released when this reader closes. */
     private final Map<String, UninvertedOrdinalsCache.Lease> uninvertedOrdinalsLeases = new HashMap<>();
 
@@ -116,6 +123,27 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
         this.segmentReadState = segmentReadState;
         this.parquetFields = parquetFields;
         this.mergedFieldInfos = mergedFieldInfos;
+        this.parquetStoredFields = selectParquetStoredFields(mapperService, parquetFields);
+    }
+
+    /**
+     * The synthetic fields whose {@code stored_fields} requests this reader serves from the
+     * Parquet column: {@code binary} fields mapped {@code store: true}. Their STORED_FIELDS
+     * capability is claimed by the Parquet format, so the Lucene secondary holds no stored
+     * value for them — the column is the store.
+     */
+    private static Map<String, FieldInfo> selectParquetStoredFields(MapperService mapperService, Map<String, FieldInfo> parquetFields) {
+        if (mapperService == null) {
+            return Map.of();
+        }
+        Map<String, FieldInfo> stored = new LinkedHashMap<>();
+        for (Map.Entry<String, FieldInfo> entry : parquetFields.entrySet()) {
+            MappedFieldType mft = mapperService.fieldType(entry.getKey());
+            if (mft != null && "binary".equals(mft.typeName()) && mft.isStored()) {
+                stored.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return stored;
     }
 
     /**
@@ -211,22 +239,56 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
     }
 
     /**
-     * Skip-index declaration for a synthetic field: RANGE for integer-shaped columns whose
-     * Parquet ColumnIndex min/max the producer can serve through a {@link DocValuesSkipper}
-     * (raw-bits order == numeric order), NONE otherwise. Must stay in sync with
-     * {@link ParquetDocValuesProducer#getSkipper}'s physical-type gate: declaring RANGE for a
-     * field whose getSkipper returns null would break consumers that trust the declaration.
+     * Skip-index declaration for a synthetic field: RANGE only when both halves agree.
+     *
+     * <p><b>Physical type</b> must be one the producer can serve stats for through a
+     * {@link DocValuesSkipper} — integer-shaped columns (INT32/INT64/BOOL: raw-bits order ==
+     * numeric order, full min/max) and BYTE_ARRAY columns (sentinel min/max that never wrongly
+     * skip, plus exact null counts, enough for existence pruning). Float/double are excluded:
+     * their IEEE-754 bit order diverges from numeric order for negatives.
+     *
+     * <p><b>DocValues type</b> must be one Lucene permits a RANGE skip index on. See
+     * {@link DocValuesSkipIndexType#RANGE}: only NUMERIC, SORTED_NUMERIC, SORTED and
+     * SORTED_SET are compatible, because a skip index records min/max and those are the
+     * ordered doc-values kinds. {@link DocValuesType#BINARY} has no ordering, so Lucene's
+     * FieldInfo constructor rejects the pair outright — which excludes {@code binary} and
+     * {@code text} here even though their BYTE_ARRAY stats would be usable for presence.
+     *
+     * <p><b>Multi-valued declarations</b> forfeit the skipper regardless of both checks above:
+     * once values repeat, OffsetIndex page rows no longer bound Lucene documents, so the
+     * producer's getSkipper refuses repeated shapes and the declaration here must agree.
+     *
+     * <p>Must stay in sync with {@link ParquetDocValuesProducer#getSkipper}: declaring RANGE
+     * for a field whose getSkipper returns null would break consumers that trust the
+     * declaration.
      */
-    private static DocValuesSkipIndexType skipIndexTypeFor(FieldTypeMapping.Mapping mapping, boolean multiValued) {
-        // A repeated column forfeits the skipper regardless of physical type: getSkipper returns null
-        // for SORTED_NUMERIC because once values repeat, OffsetIndex page rows no longer bound Lucene
-        // documents, so declaring RANGE here would break consumers that trust the declaration.
+    // Package-private for tests: the (DV type, skip index type) pairs this produces must all be
+    // constructible by Lucene's FieldInfo, which validates compatibility.
+    static DocValuesSkipIndexType skipIndexTypeFor(FieldTypeMapping.Mapping mapping, boolean multiValued) {
         if (multiValued) {
             return DocValuesSkipIndexType.NONE;
         }
         ParquetPhysicalType phys = mapping.physical();
-        boolean skippable = phys == ParquetPhysicalType.INT32 || phys == ParquetPhysicalType.INT64 || phys == ParquetPhysicalType.BOOL;
-        return skippable ? DocValuesSkipIndexType.RANGE : DocValuesSkipIndexType.NONE;
+        boolean statsServable = phys == ParquetPhysicalType.INT32
+            || phys == ParquetPhysicalType.INT64
+            || phys == ParquetPhysicalType.BOOL
+            || phys == ParquetPhysicalType.BYTE_ARRAY;
+        return statsServable && rangeCompatible(mapping.singleValued())
+            ? DocValuesSkipIndexType.RANGE
+            : DocValuesSkipIndexType.NONE;
+    }
+
+    /**
+     * Mirrors {@code DocValuesSkipIndexType.RANGE.isCompatibleWith}, which is package-private in
+     * Lucene: a RANGE skip index records min/max, so it is only defined for the ordered
+     * doc-values kinds. Keeping this explicit means an unsupported pair is filtered here rather
+     * than throwing from Lucene's FieldInfo constructor when the synthetic infos are built.
+     */
+    private static boolean rangeCompatible(DocValuesType dvType) {
+        return dvType == DocValuesType.NUMERIC
+            || dvType == DocValuesType.SORTED_NUMERIC
+            || dvType == DocValuesType.SORTED
+            || dvType == DocValuesType.SORTED_SET;
     }
 
     /** Builds a synthetic doc-values {@link FieldInfo} carrying the given DV type. */
@@ -554,7 +616,126 @@ public final class ParquetDocValuesLeafReader extends SequentialStoredFieldsLeaf
      */
     @Override
     protected StoredFieldsReader doGetSequentialStoredFieldsReader(StoredFieldsReader reader) {
-        return reader;
+        if (parquetStoredFields.isEmpty()) {
+            return reader;
+        }
+        return new ParquetBackedStoredFieldsReader(reader, new ParquetStoredLane());
+    }
+
+    @Override
+    public StoredFields storedFields() throws IOException {
+        StoredFields delegate = in.storedFields();
+        if (parquetStoredFields.isEmpty()) {
+            return delegate;
+        }
+        ParquetStoredLane lane = new ParquetStoredLane();
+        return new StoredFields() {
+            @Override
+            public void document(int docID, StoredFieldVisitor visitor) throws IOException {
+                delegate.document(docID, visitor);
+                lane.visit(docID, visitor);
+            }
+
+            @Override
+            public void prefetch(int docID) throws IOException {
+                delegate.prefetch(docID);
+            }
+        };
+    }
+
+    /**
+     * Per-consumer state for serving stored values out of Parquet columns: one dedicated column
+     * reader per field (instance-scoped cursors — see the producer's dedicatedReaderFor note on
+     * concurrent slices) and the segment's docId-to-rowId resolver, both created lazily. Each
+     * wrapper instance (and each {@code clone()} of the sequential reader) owns its own lane so
+     * cursors are never shared across threads.
+     */
+    private final class ParquetStoredLane {
+        private final Map<String, BinaryPageReader> readers = new HashMap<>();
+        private final Map<String, Boolean> repeatedByField = new HashMap<>();
+        private RowIdResolver resolver;
+
+        void visit(int docID, StoredFieldVisitor visitor) throws IOException {
+            for (FieldInfo fi : parquetStoredFields.values()) {
+                StoredFieldVisitor.Status status = visitor.needsField(fi);
+                if (status == StoredFieldVisitor.Status.STOP) {
+                    return;
+                }
+                if (status == StoredFieldVisitor.Status.NO) {
+                    continue;
+                }
+                if (resolver == null) {
+                    resolver = newRowIdResolver();
+                }
+                long rowId = resolver.toRowId(docID);
+                boolean repeated = repeatedByField.computeIfAbsent(fi.name, name -> {
+                    try {
+                        return producer().isRepeated(fi);
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                });
+                BinaryPageReader reader = readers.computeIfAbsent(fi.name, name -> {
+                    try {
+                        return producer().storedBinaryReaderFor(fi, repeated);
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                });
+                if (repeated) {
+                    // One stored entry per value, matching the classic path's one StoredField per value.
+                    for (byte[] value : reader.readRepeatedBytesAtRow(rowId)) {
+                        visitor.binaryField(fi, value);
+                    }
+                } else {
+                    byte[] value = reader.readBytesAtRow(rowId);
+                    if (value != null) {
+                        visitor.binaryField(fi, value);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * The sequential-access flavour: augments the delegate {@link StoredFieldsReader} with the
+     * Parquet-served fields. {@code clone()} clones the delegate and takes a fresh lane, keeping
+     * per-thread cursor isolation.
+     */
+    private final class ParquetBackedStoredFieldsReader extends StoredFieldsReader {
+        private final StoredFieldsReader delegate;
+        private final ParquetStoredLane lane;
+
+        ParquetBackedStoredFieldsReader(StoredFieldsReader delegate, ParquetStoredLane lane) {
+            this.delegate = delegate;
+            this.lane = lane;
+        }
+
+        @Override
+        public void document(int docID, StoredFieldVisitor visitor) throws IOException {
+            delegate.document(docID, visitor);
+            lane.visit(docID, visitor);
+        }
+
+        @Override
+        public void prefetch(int docID) throws IOException {
+            delegate.prefetch(docID);
+        }
+
+        @Override
+        public StoredFieldsReader clone() {
+            return new ParquetBackedStoredFieldsReader(delegate.clone(), new ParquetStoredLane());
+        }
+
+        @Override
+        public void checkIntegrity() throws IOException {
+            delegate.checkIntegrity();
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
+        }
     }
 
     // Cache helpers must delegate to the underlying reader so query/segment caches stay coherent.

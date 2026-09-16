@@ -53,7 +53,15 @@ public class DerivedSourceDirectoryReader extends FilterDirectoryReader {
         return new DerivedSourceDirectoryReader(in, new SubReaderWrapper() {
             @Override
             public LeafReader wrap(LeafReader reader) {
-                return new DerivedSourceLeafReader(reader, docID -> sourceProvider.apply(reader, docID));
+                // Route the per-document derive calls through a doc-values-caching view of this
+                // leaf, so rebuilding _source for many hits opens one doc-values iterator per
+                // (field, thread) instead of one per (field, document). On columnar codecs each
+                // get*DocValues call is an expensive native open, and the derive path calls it
+                // per fetched hit; the caching view collapses N-hits x M-fields opens to M.
+                // Scoped strictly to the derive path: all other consumers of this leaf keep the
+                // uncached reader and its per-call iterator semantics.
+                final LeafReader cachingView = new DocValuesCachingLeafReader(reader);
+                return new DerivedSourceLeafReader(reader, docID -> sourceProvider.apply(cachingView, docID));
             }
         }, sourceProvider);
     }

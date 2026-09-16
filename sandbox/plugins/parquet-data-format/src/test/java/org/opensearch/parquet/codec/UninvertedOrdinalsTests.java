@@ -33,7 +33,10 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
         String fileKey = "reload";
 
         try (Directory dir = newDirectory(); RandomIndexWriter writer = new RandomIndexWriter(random(), dir)) {
-            final int termCount = ParquetDocValuesProducer.checkpointInterval() + 128;
+            // The checkpoint interval moved from a class constant to the dynamic node setting
+            // surfaced by ParquetDocValuesProducer.checkpointInterval().
+            final int checkpointInterval = ParquetDocValuesProducer.checkpointInterval();
+            final int termCount = checkpointInterval + 128;
             for (int i = 0; i < termCount; i++) {
                 Document doc = new Document();
                 doc.add(new StringField("f", termValue(i), Field.Store.NO));
@@ -69,15 +72,9 @@ public class UninvertedOrdinalsTests extends OpenSearchTestCase {
                     assertEquals("existing .ord should load without rebuilding checkpoints", 0, iteratorCalls.get());
                     assertEquals(termCount, reloaded.valueCount());
                     assertEquals(termCount - 1, reloaded.ordinal(termCount - 1));
-                    assertEquals(
-                        termValue(ParquetDocValuesProducer.checkpointInterval() + 5),
-                        reloaded.term(ParquetDocValuesProducer.checkpointInterval() + 5).utf8ToString()
-                    );
+                    assertEquals(termValue(checkpointInterval + 5), reloaded.term(checkpointInterval + 5).utf8ToString());
                     assertEquals(1, iteratorCalls.get());
-                    assertEquals(
-                        ParquetDocValuesProducer.checkpointInterval() + 5,
-                        reloaded.rank(new BytesRef(termValue(ParquetDocValuesProducer.checkpointInterval() + 5)))
-                    );
+                    assertEquals(checkpointInterval + 5, reloaded.rank(new BytesRef(termValue(checkpointInterval + 5))));
                 }
             }
         }

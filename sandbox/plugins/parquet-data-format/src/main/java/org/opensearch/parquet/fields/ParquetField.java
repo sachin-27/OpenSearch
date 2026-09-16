@@ -122,6 +122,19 @@ public abstract class ParquetField {
     }
 
     /**
+     * Normalizes one document's values before they are written into a list column. The default
+     * preserves arrival order and duplicates. Types whose classic Lucene doc-values encoding
+     * imposes an order (binary's packed encoding is sorted and de-duplicated) override this so
+     * the columnar store carries identical semantics and readers can serve values as stored.
+     *
+     * @param values the parsed values in arrival order (never null; elements may be null)
+     * @return the values to write, in write order
+     */
+    protected List<?> normalizeListValues(List<?> values) {
+        return values;
+    }
+
+    /**
      * Writes all values collected for one document into a list column at the current row.
      * <p>
      * A null {@code parseValue} is written as a null list, which is how an absent field is
@@ -134,7 +147,7 @@ public abstract class ParquetField {
             listVector.setNull(row);
             return;
         }
-        List<?> values = parseValue instanceof List<?> list ? list : List.of(parseValue);
+        List<?> values = normalizeListValues(parseValue instanceof List<?> list ? list : List.of(parseValue));
         int start = listVector.startNewValue(row);
         FieldVector dataVector = listVector.getDataVector();
         for (int i = 0; i < values.size(); i++) {
